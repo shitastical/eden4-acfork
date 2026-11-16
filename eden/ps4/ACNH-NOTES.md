@@ -1500,3 +1500,46 @@ before touching `ps4_sink.cpp`, because a shorter buffer costs submit overhead o
 every scene to fix something that may not be there.
 
 The default is `audio=on`, i.e. the normal path, so leave it out of `ps4.ini` except for the test.
+
+## Run R — the audio queue bound that was never set
+
+`SinkStream::WaitFreeSpace` gates the ADSP renderer before every render command:
+
+```cpp
+auto can_continue = [this]() { return paused || queued_buffers < max_queue_size; };
+release_cv.wait_for(lk, 7ms, can_continue);
+if (queued_buffers > max_queue_size + 3) {
+    release_cv.wait(lk, stop_token, can_continue);   // cannot end
+}
+```
+
+`max_queue_size` defaults to 0 and **nothing in the tree calls `SetRingSize`** (the setter exists
+and is unreferenced). So `queued_buffers < max_queue_size` is `queued < 0`: never true, in both
+waits. Two consequences, both live in every run so far:
+
+- the first wait always burns the full 7 ms timeout, on every render command;
+- if more than three buffers are ever queued, the second wait can never be satisfied (its
+  predicate is the same impossible comparison) and the ADSP thread parks until the process is
+  stopped. Since the app's `RequestUpdateAudioRenderer` blocks on that thread's `RenderResponse`,
+  the frame that hit it waits with it.
+
+`ps4_sink.cpp` now calls `SetRingSize(8)` when it creates a stream. Eight is above anything the
+guest keeps in flight — its own audout buffer count is 2–4 and `IsBufferConsumed` bounds it — so
+the predicate is true on entry and the 7 ms tax disappears instead of being replaced by a
+different throttle. This does not change `FramesPerBuffer` (1024) or the 21.3 ms `sceAudioOutOutput`
+period, so the device's real-time pacing is untouched: what changes is that the audio thread no
+longer sleeps 7 ms per command and can no longer park forever.
+
+Measured context for the plateau, from the same session (`eden.previous.log`, t≈740 s):
+
+| counter | value |
+| --- | --- |
+| composites / flips | 12105 / 12105 — nothing dropped, so the frame really is 227–234 ms |
+| stage | `waiting for next guest display` — the emulator is waiting on the guest |
+| audio buffers | 470 per 10 s ≈ 47/s, the hardware ceiling (1 / 21.33 ms), so audio never starved |
+| guest memory callbacks | +976,350 per 10 s (~98k/s) — slow-path guest accesses, not page faults |
+| thread samples | CPUCore_2 77.7% system, CPUCore_3 100% system, GPU 97.7% system |
+
+Every thread parked in system time while the frame takes 230 ms says the frame is gated by
+something outside the guest's instruction stream. The two candidate gates are the audio reply (now
+bounded, see above) and the display pipeline, and the null-audio run is what separates them.

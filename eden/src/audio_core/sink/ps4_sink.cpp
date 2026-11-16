@@ -15,6 +15,7 @@
 namespace AudioCore::Sink {
 namespace {
 constexpr u32 FramesPerBuffer = 1024;
+constexpr u32 kQueueBuffers = 8;
 class PS4SinkStream final : public SinkStream {
 public:
     PS4SinkStream(Core::System& system_, u32 channels, StreamType type_)
@@ -106,6 +107,13 @@ PS4Sink::~PS4Sink() { CloseStreams(); }
 SinkStream* PS4Sink::AcquireSinkStream(Core::System& system, u32 channels,
                                       const std::string&, StreamType type) {
     auto stream = std::make_unique<PS4SinkStream>(system, channels, type);
+    // SinkStream::WaitFreeSpace waits for `queued_buffers < max_queue_size`, and nothing in this
+    // tree ever calls SetRingSize, so the default 0 makes that condition unsatisfiable: every
+    // ADSP render command pays the full 7 ms timeout, and once more than three buffers are queued
+    // the wait cannot end at all — the app's RequestUpdateAudioRenderer would never get its reply.
+    // Eight buffers is more than the guest ever keeps in flight, so the wait returns at once and
+    // the send-ahead bound is left to the guest's own buffer count.
+    stream->SetRingSize(kQueueBuffers);
     stream->SetDeviceVolume(device_volume);
     stream->SetSystemVolume(system_volume);
     auto* result = stream.get();
