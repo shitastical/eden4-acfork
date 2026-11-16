@@ -2,6 +2,7 @@
 // VideoOut presentation follows DolphinPS4's RADV integration (GPL-2.0-or-later).
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <array>
 #include <limits>
@@ -178,6 +179,7 @@ bool Swapchain::AcquireNextImage() {
     image_index = frame_index;
     const s64 previous = ps4->last_flip[image_index];
     if (previous != 0) {
+        const auto wait_started = std::chrono::steady_clock::now();
         bool available = false;
         for (u32 attempt = 0; attempt < 1000; ++attempt) {
             OrbisVideoOutFlipStatus status{};
@@ -186,6 +188,9 @@ bool Swapchain::AcquireNextImage() {
             if (status.flipArg > previous) { available = true; break; }
             usleep(1000);
         }
+        Common::PS4Diagnostics::buffer_wait_us.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_started).count());
         if (!available) {
             LOG_ERROR(Render_Vulkan, "PS4 display did not release buffer {}", image_index);
             throw vk::Exception(VK_TIMEOUT);
@@ -215,8 +220,14 @@ void Swapchain::Present(VkSemaphore) {
     if (result != 0) {
         {
             Common::PS4Diagnostics::stage = "waiting for GPU display copy";
-            std::scoped_lock lock{scheduler.submit_mutex};
-            vk::Check(device.GetLogical().WaitIdle());
+            const auto idle_started = std::chrono::steady_clock::now();
+            {
+                std::scoped_lock lock{scheduler.submit_mutex};
+                vk::Check(device.GetLogical().WaitIdle());
+            }
+            Common::PS4Diagnostics::gpu_idle_us.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - idle_started).count());
         }
         Common::PS4Diagnostics::stage = "submitting VideoOut flip";
         result = sceVideoOutSubmitFlip(ps4->video, static_cast<int>(image_index), mode, argument);
@@ -228,6 +239,7 @@ void Swapchain::Present(VkSemaphore) {
     ps4->submitted = argument;
     ps4->last_flip[image_index] = argument;
     const auto flip = ++Common::PS4Diagnostics::flips;
+    ++Common::PS4Diagnostics::presented_frames;
     if (flip <= 3) {
         LOG_INFO(Render_Vulkan, "PS4 VideoOut flip {} submitted: buffer={}, argument={}, {}",
                  flip, image_index, argument, ps4->gpu_flips ? "queued on the GPU" : "after GPU idle");

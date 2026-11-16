@@ -38,12 +38,22 @@ inline std::atomic<bool> videoout_argb{false};
 inline std::atomic<u64> composites{};
 inline std::atomic<u64> flips{};
 inline std::atomic<u64> audio_buffers{};
+// Where the renderer's wall time goes, in microseconds: blocked waiting for VideoOut to release a
+// display buffer (the GPU plus display latency), and blocked waiting for the GPU to go idle in the
+// fallback flip path. Sampled per 10 s window next to the frame rate, they split a slow frame into
+// "guest CPU" and "graphics" without a profiler running.
+inline std::atomic<u64> buffer_wait_us{};
+inline std::atomic<u64> gpu_idle_us{};
+inline std::atomic<u64> presented_frames{};
 inline std::atomic<const char*> stage{"waiting for guest display"};
 
 inline void Reset() {
     composites = 0;
     flips = 0;
     audio_buffers = 0;
+    buffer_wait_us = 0;
+    gpu_idle_us = 0;
+    presented_frames = 0;
     stage = "waiting for guest display";
 }
 

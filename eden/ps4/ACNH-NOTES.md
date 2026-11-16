@@ -113,6 +113,11 @@ because no *single contiguous* block was big enough any more — 168 MiB free, a
 island intro wanted more than that at once. The reserve was still holding memory the
 heap could otherwise have had.
 
+The perf line now also prints `display wait X ms/frame, gpu idle Y ms/frame`: blocked time in
+`AcquireNextImage` (GPU plus VideoOut latency) and in the unqueued-flip `WaitIdle` fallback.
+Whatever is left of the frame time is the guest's own work, so one run splits the 47 ms
+without a profiler running (the profiler itself costs frame rate).
+
 **Run D — reserve 32 MiB, guest 3648 MiB, applet pool 59 MiB**
 
 Expected: ~450 MiB of contiguous free direct memory. Awaiting a long test. Only the
@@ -178,6 +183,24 @@ Not yet optimised; this is the baseline to work from. Target is 30 fps.
   it to buy memory would trade a crash for a worse frame rate — don't.
 - `memory callbacks` sounds alarming (166 million) but over a 13-minute run that is
   ~0.02% of executed instructions. It is a red herring; don't chase it.
+- **Where the 47 ms actually went (Run E, profiler on):** cores 0–2 spent 44–69% of wall
+  time executing translated code and the rest parked; the GPU, Vulkan, vsync and audio
+  threads were 87–99% *parked*. Emulation speed stayed at 100%. A JIT bottleneck drags
+  emulation speed below 100%, so the guest is **blocked on graphics, not short of CPU**.
+- Two sampler traps, both of which read as false alarms:
+  - `guest-jit 0.0%` does not mean the JIT is idle. This port's code cache lives in direct
+    memory, which the sampler has no bucket for, so executed guest code is counted as
+    `other` — and `other` is the 44–69% above.
+  - `system 74%` is not syscall overhead. Every blocked thread samples at the same park
+    address (`0x800003710`), so a high `system` share just means "threads are asleep".
+- `gpu_accuracy` is **dead code in this tree** — nothing reads `current_gpu_accuracy`, so
+  switching it High/Normal changes nothing. Don't spend a build on it.
+- `async_presentation` is real (it spawns a present thread) but is force-disabled under
+  `__OPENORBIS__` in `vk_present_manager.cpp` because VideoOut waits for GPU completion;
+  re-enabling it needs that wait dealt with first, not a settings flip.
+- Frame pacing on a 60 Hz display quantises to 16.7 ms slots: 30 fps needs the frame under
+  33.3 ms, and 47 ms drops to 50 ms (20 fps). A 47 ms frame therefore reads as ~21 fps, and
+  shaving ~14 ms would snap it to 30 — the target is a 30% cut, not a full rewrite.
 - **How to tell whether the frame is CPU- or GPU-bound:** count the `stage=` values
   in the heartbeat. `waiting for next guest display` means the frontend finished
   copying and is idle waiting for the guest to produce a frame; `copying to VideoOut

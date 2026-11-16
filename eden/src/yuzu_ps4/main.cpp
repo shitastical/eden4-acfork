@@ -620,8 +620,19 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
                      Common::PS4Diagnostics::MemoryCallbackTotal());
             Common::PS4Diagnostics::LogDirectMemory("heartbeat");
             const auto perf = system.GetAndResetPerfStats();
-            LOG_INFO(Frontend, "PS4 performance: game {:.1f} fps, emulation speed {:.0f}%, frame time {:.1f} ms",
-                     perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0);
+            // Per-frame split of the renderer's blocked time: display wait is the GPU plus VideoOut
+            // latency, gpu idle is the unqueued-flip fallback. Whatever is left of the frame is the
+            // guest's own work.
+            const u64 frames = Common::PS4Diagnostics::presented_frames.exchange(0);
+            const u64 wait_us = Common::PS4Diagnostics::buffer_wait_us.exchange(0);
+            const u64 idle_us = Common::PS4Diagnostics::gpu_idle_us.exchange(0);
+            const double per_frame = frames != 0 ? 1.0 / static_cast<double>(frames) : 0.0;
+            LOG_INFO(Frontend,
+                     "PS4 performance: game {:.1f} fps, emulation speed {:.0f}%, frame time {:.1f} ms, "
+                     "display wait {:.1f} ms/frame, gpu idle {:.1f} ms/frame, frames {}",
+                     perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
+                     static_cast<double>(wait_us) / 1000.0 * per_frame,
+                     static_cast<double>(idle_us) / 1000.0 * per_frame, frames);
             if (Common::PS4Diagnostics::profiler)
                 DrainProfiler(system);
             next_status = std::chrono::steady_clock::now() + std::chrono::seconds{10};
