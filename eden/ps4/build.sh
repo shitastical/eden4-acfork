@@ -15,8 +15,10 @@ VERSION="${EDEN4_VERSION:-01.00}"   # PKG version, XX.YY
 # never collides with EDEN00002, so both can be installed at once. The ACNH tail of the game's
 # own title id (01006F8002326000) is what the digits spell. make-pkg.sh requires AAAA99999.
 TITLE_ID="${ACNH_TITLE_ID:-CUSA23260}"
-# Shown on the PS4 home screen. Kept out of NAME so the package filename stays space-free.
+# Shown on the PS4 home screen; also the package filename, with the colon dropped because it is
+# not wanted in a filename. Spaces are fine on the console's FTP and installers.
 APP_TITLE="${ACNH_APP_TITLE:-Animal Crossing: New Horizons}"
+PKG_NAME="${ACNH_PKG_NAME:-${APP_TITLE//:/}}"   # -> "Animal Crossing New Horizons.pkg"
 # Content-id label, padded by make-pkg.sh: IV0000-CUSA23260_00-ACNH000000000000
 CONTENT_LABEL="${ACNH_CONTENT_LABEL:-ACNH}"
 # Eden4's data lives in /data/EdenPS4; this fork uses /data/ACNH so the two never share settings.
@@ -73,6 +75,6 @@ PKG="$(INCLUDE_PIGLET_MODULES=0 SFO_STYLE=plain SFO_ATTRIBUTE="$ATTRIBUTE" "$DOL
     "$STAGE" "$TITLE_ID" "$APP_TITLE" "$VERSION" "$CONTENT_LABEL" "$OUT" | tail -1)"
 export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 "$OPENORBIS/bin/linux/PkgTool.Core" pkg_validate "$PKG"
-FINAL="$OUT/$NAME-$VERSION$SUFFIX.pkg"
+FINAL="$OUT/$PKG_NAME$SUFFIX.pkg"
 cp "$PKG" "$FINAL"
 printf 'Package: %s\n' "$FINAL"

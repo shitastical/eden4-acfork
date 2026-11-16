@@ -20,7 +20,7 @@ the standalone `eden4-acfork` package described in
 | Guest RAM placement | `0x20002c000`, software page tables |
 | FTP | `ftp://<console>:2121`, anonymous, GoldHEN |
 | Installed app | `/user/app/CUSA23260/` — `app.pkg` (68,681,728 B), `app.pbm`, `app.json`, `app.xml` |
-| Package | `CUSA23260`, content id `IV0000-CUSA23260_00-ACNH000000000000` |
+| Package | `CUSA23260`, content id `IV0000-CUSA23260_00-ACNH000000000000`, file `Animal Crossing New Horizons.pkg` |
 | Game file | `/data/ACNH/games/Animal Crossing New Horizons [01006F8002326000][US][v0].nsp` (6,694,761,920 B) |
 | Settings | `/data/ACNH/ps4.ini` |
 | Shader cache | `/data/ACNH/cache/shader/01006f8002326000/` |
@@ -53,7 +53,8 @@ with it.
 
 | Thing | Value | Why |
 |---|---|---|
-| Package name | `eden4-acfork` | distro/pkg filename, no spaces |
+| Repo / binary | `eden4-acfork` | the fork's own name, unchanged in source |
+| Package file | `Animal Crossing New Horizons.pkg` | the installed file reads as the game, not as an emulator |
 | App title | `Animal Crossing: New Horizons` | what the XMB shows |
 | Title id | `CUSA23260` | must match `^[A-Z]{4}[0-9]{5}$`; taken from the game's own id so it reads as ACNH |
 | Content id | `IV0000-CUSA23260_00-ACNH000000000000` | `ACNH` label, padded to 16 |
@@ -319,7 +320,7 @@ unshare -rm /path/to/ps4ns.sh bash -c '
   source runtime/scripts/ps4-env.sh
   unset LDFLAGS CFLAGS CXXFLAGS CPPFLAGS LIBS
   ninja -C "$PS4_BUILD_ROOT/build/eden" eden-ps4_eboot -j6'
-bash eden/ps4/build.sh --no-configure      # packages eden4-acfork-<version>.pkg
+bash eden/ps4/build.sh --no-configure      # packages "Animal Crossing New Horizons.pkg"
 ```
 
 The `unset` matters: `build.sh` re-sources `ps4vars.sh`, which re-exports `LDFLAGS`,
@@ -329,8 +330,10 @@ sidesteps it.
 
 Then, over FTP: upload the pkg to `/data/pkg/`, install on the console, launch.
 `check-oelf.py` should report `PASS` and every package digest should read `OK`.
-The output is `~/eden4-build/out/eden4-acfork-01.00.pkg` (68,681,728 B for this
-build); it installs next to a stock Eden4 package with no shared data.
+The output is `~/eden4-build/out/Animal Crossing New Horizons.pkg` (68,681,728 B for
+this build). The filename comes from `APP_TITLE` with the colon dropped (`PKG_NAME` in
+`build.sh`, overridable with `ACNH_PKG_NAME`), so the package reads as the game rather
+than as an emulator. It installs next to a stock Eden4 package with no shared data.
 
 First-run setup on a console that already ran the old build (done once, scripted over
 FTP; renames, so the 6.2 GB game file moves instantly):
@@ -475,7 +478,8 @@ loaded from the image before any GoldHEN plugin can redirect it. GoldHEN's AFR
 plugin can substitute *data* files opened at runtime, which is useful for
 `ps4.ini` and caches but not for the binary.
 
-So every code change is: rebuild → package → FTP the 68,681,728-byte pkg → install.
+So every code change is: rebuild → package → FTP the 68,681,728-byte
+`Animal Crossing New Horizons.pkg` → install.
 `ps4.ini` and the shader cache *can* be edited live over FTP.
 
 Operational notes that cost time before:
@@ -506,7 +510,7 @@ What changed in this build, relative to Run F (the last one that ran on hardware
 | `autolaunch=1` default | boot straight into the game | none; falls back to the menu when no ACNH file is found |
 | `framelog=1` default | per-frame `frame,gap_ms` for offline analysis | one buffered line per frame |
 
-Build facts for this pkg: `eden4-acfork-01.00.pkg`, 68,681,728 B, `check-oelf` PASS,
+Build facts for this pkg: `Animal Crossing New Horizons.pkg`, 68,681,728 B, `check-oelf` PASS,
 all 28 package digests `OK`, uploaded to `/data/pkg/`. Console state: prepared and
 verified over FTP (tree, NSP, nand, shader cache, keys, `ps4.ini`).
 
