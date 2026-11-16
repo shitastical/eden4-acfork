@@ -13,3 +13,4 @@ The PS4 build of Eden (Eden4). See the repository's [README](../../README.md),
 | `cpu-smoke.S`, `build-cpu-smoke.sh` | A tiny AArch64 program for the CPU self-test entries (only with `EDEN4_SELF_TEST=1`) |
 | `diagnostics/`, `build-diagnostics.sh` | A standalone PS4 app that checks threads, the JIT, VideoOut and memory |
 | `tests/` | Host-side tests of PS4-specific helpers |
+| [`ACNH-NOTES.md`](ACNH-NOTES.md) | Measured findings from getting Animal Crossing in-game: the memory budget, the `std::bad_alloc` crash, why guest RAM cannot simply be shrunk, and the build/console workflow |
