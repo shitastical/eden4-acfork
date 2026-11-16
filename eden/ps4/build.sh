@@ -25,6 +25,10 @@ CONTENT_LABEL="${ACNH_CONTENT_LABEL:-ACNH}"
 APP_DATA_DIR="${ACNH_DATA_DIR:-/data/ACNH}"
 
 if [ "${1:-}" != --no-configure ]; then "$HERE/configure.sh"; fi
+# The build stamp printed at startup is main.cpp's __DATE__/__TIME__ ("PS4 build: …"), which only
+# advances when that file is recompiled. Touching it makes every package say which build it is, so
+# a log can never again be mistaken for a newer binary than the one that produced it.
+touch "$HERE/../src/yuzu_ps4/main.cpp"
 cmake --build "$BUILD" --target eden-ps4_eboot -j"$JOBS"
 python3 "$DOLPHIN_PS4_ROOT/toolchain/check-oelf.py" \
     "$BUILD/src/yuzu_ps4/eden-ps4_eboot/eden-ps4.oelf"

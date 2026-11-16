@@ -1630,3 +1630,34 @@ not the plateau.
    count/largest to `PS4 progress`, so the 544 MiB can be attributed to a subsystem.
 3. Time emit without a clock read per block (accumulate around the whole batch) to check whether the
    72.8 µs/block is real.
+
+## Run S — the opening scene is at 17–23 fps, and the speech pins to the audio buffer
+
+The first run of the 96/128/48/16 build (airport opening, Timmy and Tommy talking) shows the
+plateau is gone:
+
+- `PS4 performance`: 17.1–22.9 fps, frame time 55.9–61.2 ms (was 4.3 fps / 230.7 ms).
+- `PS4 JIT 0x2ea02c000` (core 1, now 128 MiB): **1 cache clear** at t=173 s. The same core cleared
+  7 times in 762 s on 64 MiB.
+- `PS4 guest waits` finally prints, so the hook is live: ~2,200 waits per window and
+  **27.7–51.5 ms/frame blocked in svcWaitSynchronization**, of which `KReadableEvent` is ~1,410
+  calls totalling 8.1–8.3 s per 10 s window, longest 7.7–27.9 ms.
+- The frame log for the last 800 frames peaks at 30–35 ms (167), 45–50 ms (149) and 95–100 ms (55).
+  45–50 is 2 × 21.33 ms and 95–100 is 4–4.5 × 21.33 ms; the 30–35 ms cluster is one 33.33 ms vsync.
+
+That last row is the finding: **the speech frames quantise to the audio output period, not to the
+vsync grid.** `ps4_sink.cpp` opened `sceAudioOutOutput` with 1024 frames = 21.33 ms, and the device
+drains exactly one buffer per period (`audio buffers` climbs 469 per 10 s = 47/s, the hardware
+rate). The guest's audio renderer cannot get ahead of the device, so any frame that has to hand
+over N buffers waits N × 21.33 ms. Speech is the case that hands over more than one.
+
+Change: the open call now asks for 512 frames (10.67 ms) and falls back to 1024 if the hardware
+rejects the width, so the worst case is the behaviour measured above. Prediction to falsify:
+speech frames move from ~45 ms and ~95 ms to ~35 ms and ~55 ms, and the 95–100 ms cluster
+disappears. If instead the clusters stay exactly where they are, the device is not the gate and the
+wait is guest-side.
+
+Also fixed the fingerprint problem that cost a day: the startup stamp is main.cpp's
+`__DATE__/__TIME__`, so a build that changed only other files printed an old time (this run says
+`Nov 16 2026 08:13:27` although the binary was linked at 08:23). `build.sh` now touches
+`main.cpp` before building, so every package reports the build that produced it.

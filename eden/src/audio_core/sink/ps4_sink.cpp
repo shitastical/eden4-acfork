@@ -14,7 +14,15 @@
 
 namespace AudioCore::Sink {
 namespace {
-constexpr u32 FramesPerBuffer = 1024;
+// The device drains one buffer per frames/TargetSampleRate, and the guest's audio renderer can
+// never get ahead of it, so this period is the quantisation of any frame that is waiting on
+// audio. At 1024 frames that is 21.33 ms — 64% of a 30 Hz frame — and it shows up in the frame
+// log as gaps clustered on multiples of 21.3 ms while the attendant speaks. 512 halves the
+// quantisation to 10.67 ms for one extra sceAudioOutOutput call per period. The open call is
+// offered the preferred width first and the old one second: the accepted widths are a property
+// of the hardware, so a rejected 512 must not leave the sink dead.
+constexpr u32 kPreferredFramesPerBuffer = 512;
+constexpr u32 kFallbackFramesPerBuffer = 1024;
 constexpr u32 kQueueBuffers = 8;
 class PS4SinkStream final : public SinkStream {
 public:
@@ -23,14 +31,28 @@ public:
         system_channels = channels;
         device_channels = 2;
         if (type != StreamType::In) {
-            port = sceAudioOutOpen(0xff, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, FramesPerBuffer,
+            port = sceAudioOutOpen(0xff, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kPreferredFramesPerBuffer,
                 TargetSampleRate, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+            if (port >= 0) {
+                frames_per_buffer = kPreferredFramesPerBuffer;
+            } else {
+                LOG_WARNING(Audio_Sink, "PS4 AudioOut rejected {} frames ({:#x}), retrying with {}",
+                            kPreferredFramesPerBuffer, u32(port), kFallbackFramesPerBuffer);
+                port = sceAudioOutOpen(0xff, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0,
+                    kFallbackFramesPerBuffer, TargetSampleRate, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+                if (port >= 0) {
+                    frames_per_buffer = kFallbackFramesPerBuffer;
+                }
+            }
             if (port < 0) {
                 LOG_ERROR(Audio_Sink, "PS4 AudioOut open failed: {:#x}", u32(port));
                 throw std::runtime_error{"PS4 AudioOut unavailable"};
             }
-            LOG_INFO(Audio_Sink, "PS4 AudioOut opened: port={}, 48000 Hz stereo, {} guest channels",
-                     port, channels);
+            LOG_INFO(Audio_Sink,
+                     "PS4 AudioOut opened: port={}, 48000 Hz stereo, {} frames/buffer ({:.2f} ms), "
+                     "{} guest channels",
+                     port, frames_per_buffer, 1000.0 * frames_per_buffer / TargetSampleRate,
+                     channels);
         } else {
             LOG_WARNING(Audio_Sink, "PS4 microphone capture supplies silence");
         }
@@ -65,15 +87,15 @@ private:
     void Output() {
         Common::SetCurrentThreadName("PS4AudioOut");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
-        std::array<std::array<s16, FramesPerBuffer * 2>, 2> buffers{};
+        std::array<std::array<s16, kFallbackFramesPerBuffer * 2>, 2> buffers{};
         size_t index{};
         while (running) {
             auto& buffer = buffers[index];
             if (type == StreamType::In) {
-                ProcessAudioIn(buffer, FramesPerBuffer);
-                usleep(FramesPerBuffer * 1000000ULL / TargetSampleRate);
+                ProcessAudioIn(buffer, frames_per_buffer);
+                usleep(frames_per_buffer * 1000000ULL / TargetSampleRate);
             } else {
-                ProcessAudioOutAndRender(buffer, FramesPerBuffer);
+                ProcessAudioOutAndRender(buffer, frames_per_buffer);
                 const int result = sceAudioOutOutput(port, buffer.data());
                 if (result < 0) {
                     LOG_ERROR(Audio_Sink, "PS4 AudioOut output failed: {:#x}", u32(result));
@@ -91,6 +113,7 @@ private:
         SignalPause();
     }
     int port{-1};
+    u32 frames_per_buffer{kFallbackFramesPerBuffer};
     std::atomic<bool> running{};
     std::thread worker;
 };
