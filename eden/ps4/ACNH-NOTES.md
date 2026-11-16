@@ -550,6 +550,19 @@ or more to reach its first frame on this port (Run F: renderer init at 47.6 s, a
 that was with the menu adding time). The boot splash is static, so a slow boot is
 indistinguishable from a frozen overlay. `logs/eden.log` has a 10-second heartbeat
 with `stage=` for exactly this; `frames.log` starts the moment the game does present.
+3. **The console's own launch screen was never dismissed.** The XMB draws that screen
+with the app's `pic1` banner art, and it stays on top of VideoOut until the app asks
+for it to be removed — ACNH's own art covering the game is exactly what it looks
+like. Nothing in this tree called `sceSystemServiceHideSplashScreen()`. It is now
+called once, at the first moment a frame of ours is actually up (the boot splash
+flip, or the first game frame if there is no splash picture), so the console's
+banner is replaced by our boot screen and then by the game. `eden.log` records
+`PS4 launch screen dismissed: 0x0`.
+
+That is also the cheapest way to tell the two failure modes apart: if the screen
+switches to the boot splash (game icon, title, **Loading** ring), VideoOut is visible
+and only the game's own first frame is pending; if it stays on the banner art, the
+console never saw a frame from us and the problem is VideoOut, not the game.
 
 **Still to measure** (needs a run that lasts long enough): the numbers to compare
 against Run F are:

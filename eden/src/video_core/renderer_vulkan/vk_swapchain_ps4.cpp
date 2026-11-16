@@ -19,9 +19,20 @@
 
 // RADV's PS4 winsys (ac_ps4_drm.c): queues a VideoOut flip behind all GPU work submitted so far.
 extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
+// Dismisses the console's "launching" screen. The XMB draws that screen from the app's own pic1
+// banner art, and it can stay on top of VideoOut until the app asks for it to go, which reads as
+// the banner art covering the game. Called once, as soon as a frame of ours is actually up.
+extern "C" int sceSystemServiceHideSplashScreen();
 
 namespace Vulkan {
 namespace {
+
+void HideLaunchScreen() {
+    static std::atomic<bool> hidden{false};
+    if (hidden.exchange(true)) return;
+    const int result = sceSystemServiceHideSplashScreen();
+    LOG_INFO(Render_Vulkan, "PS4 launch screen dismissed: {:#x}", u32(result));
+}
 
 // ps4.ini framelog=1 (the default): one line per presented frame, "frame,gap_ms", where gap_ms is
 // the wall-clock time since the previous frame. This is the number the perf line averages every
@@ -209,6 +220,8 @@ void Swapchain::Create(VkSurfaceKHR_T* surface_, u32 width_, u32 height_) {
             ps4->last_flip[0] = 1;
             frame_index = 1;
             LOG_INFO(Render_Vulkan, "PS4 display: loading screen shown until the first game frame");
+            // Our own frame is on screen now, so the launcher's banner art has been replaced.
+            HideLaunchScreen();
         }
     }
     LOG_INFO(Render_Vulkan, "PS4 RADV display ready: {}x{}, {} buffers, pitch {}",
@@ -280,6 +293,7 @@ void Swapchain::Present(VkSemaphore) {
     ps4->last_flip[image_index] = argument;
     const auto flip = ++Common::PS4Diagnostics::flips;
     ++Common::PS4Diagnostics::presented_frames;
+    HideLaunchScreen();
     LogFrame(flip);
     if (flip <= 3) {
         LOG_INFO(Render_Vulkan, "PS4 VideoOut flip {} submitted: buffer={}, argument={}, {}",
