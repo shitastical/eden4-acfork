@@ -275,9 +275,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Code cache size
 #if defined(__OPENORBIS__)
-    // ACNH clears a 64 MiB cache six times in fourteen minutes, and every clear throws away the
-    // translated code it then has to rebuild. 96 MiB halves that against memory the host has.
-    config.code_cache_size = std::uint32_t(96_MiB);
+    // Do not raise this. The cache is allocated from *flexible* memory, so it competes with the
+    // C heap and Vulkan for whatever the guest DRAM left over. At 96 MiB the fourth core's
+    // allocation failed with 0x8002000c (ENOMEM) before emulation even started, and the
+    // resulting std::bad_alloc aborted the process. 64 MiB x4 is the size that fits.
+    config.code_cache_size = std::uint32_t(64_MiB);
 #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else

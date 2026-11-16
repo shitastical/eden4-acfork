@@ -1025,7 +1025,7 @@ void Launcher::Render(Canvas& canvas) {
             const bool current = st.user_page == host.CurrentUser();
             canvas.Text(current ? "Current User" : "Press Cross to use this user", 1098, 403, 30, current ? p.accent : p.copy);
             canvas.HLine(1062, 1800, 452, 1.5f, p.line);
-            TextBlock(x, "Save data is kept separately for each user, in /data/EdenPS4/nand.", 1098, 495, 24, p.copy, 666, 36, 2);
+            TextBlock(x, "Save data is kept separately for each user, in /data/ACNH/nand.", 1098, 495, 24, p.copy, 666, 36, 2);
         } else {
             canvas.Text("Add a user to Eden4.", 714, 350, 30, p.text);
             TextBlock(x, "Each user keeps their own save data. Up to 8 users.", 714, 420, 26, p.copy, 1086, 39, 3);
@@ -1120,7 +1120,7 @@ void Launcher::Render(Canvas& canvas) {
             y += 80;
         }
         TextBlock(x, "Games are found in each source's folder and one folder down (for example a USB drive's "
-                     "switch folder). NSP, XCI, NRO and NSO files. Keys go in /data/EdenPS4/keys.",
+                     "switch folder). NSP, XCI, NRO and NSO files. Keys go in /data/ACNH/keys.",
                   844, y + 50, 22, p.copy, 952, 34, 4);
         if (!st.message.empty()) canvas.Text(st.message, 844, 900, 22, p.accent, Align::Left, 950);
         const bool add = st.file_row >= int(sources.size());

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <dirent.h>
 #include <map>
@@ -25,6 +26,7 @@
 #include "common/logging.h"
 #include "common/param_package.h"
 #include "common/ps4_diagnostics.h"
+#include "common/ps4_paths.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -96,7 +98,7 @@ bool IsDirectory(const std::string& path) {
 }
 
 std::vector<SourceDef> SourceDefs(const std::vector<std::string>& custom) {
-    std::vector<SourceDef> defs{{"internal", "Internal storage", "/data/EdenPS4/games", false}};
+    std::vector<SourceDef> defs{{"internal", "Internal storage", Ps4Paths::Games, false}};
     // USB 1 is always listed (it shows "Not connected"); further drives when they are plugged in.
     for (int i = 0; i < 8; ++i) {
         const std::string path = "/mnt/usb" + std::to_string(i);
@@ -168,14 +170,14 @@ std::vector<Game> ScanGames(const std::vector<SourceDef>& sources, const std::se
 std::string ExportLogs() {
     Common::Log::Stop();
     const char* names[] = {"eden.log", "eden.previous.log", "xmb-trace.log", "boot-trace.log",
-                           "crash.log", "samples.log"};
+                           "crash.log", "samples.log", "frames.log"};
     size_t copied{};
     for (const char* mount : {"/mnt/usb0", "/mnt/usb1"}) {
         for (const char* name : names) {
-            const std::string source = std::string{"/data/EdenPS4/"} + name;
+            const std::string source = std::string{Ps4Paths::Logs} + "/" + name;
             FILE* input = fopen(source.c_str(), "rb");
             if (!input) continue;
-            const std::string destination = std::string{mount} + "/EdenPS4-" + name;
+            const std::string destination = std::string{mount} + "/ACNH-" + name;
             FILE* output = fopen(destination.c_str(), "wb");
             if (!output) { fclose(input); continue; }
             bool success = true;
@@ -190,8 +192,8 @@ std::string ExportLogs() {
             if (success) ++copied;
         }
     }
-    return copied ? "Logs copied to USB. You can attach the EdenPS4-*.log files." :
-                    "USB unavailable. Logs remain in /data/EdenPS4/";
+    return copied ? "Logs copied to USB. You can attach the ACNH-*.log files." :
+                    "USB unavailable. Logs remain in /data/ACNH/logs/";
 }
 
 // Every ps4.ini switch: read at startup, shown in System Settings (by category), saved back.
@@ -221,9 +223,15 @@ std::vector<Option> g_options = {
      CONTROLLER_TYPES},
     {"player4_type", "Player 4 controller", "The Switch controller this PS4 controller acts as.", "controllers",
      CONTROLLER_TYPES},
+    {"autolaunch", "Launch Animal Crossing on start",
+     "Boots the game in /data/ACNH/games straight away. Turn off to reach this menu.", "display",
+     {{"1", "On"}, {"0", "Off"}}},
     {"ui_theme", "Theme", "", "theme", {{"black", "Basic Black"}, {"white", "Basic White"}}},
     {"ui_sounds", "Menu sounds", "Sounds when you move around the HOME menu. Games are not affected.", "sound",
      {{"on", "On"}, {"off", "Off"}}},
+    {"framelog", "Per-frame log",
+     "Appends one line per frame to /data/ACNH/logs/frames.log for offline analysis.", "debug",
+     {{"1", "On"}, {"0", "Off"}}},
     {"profile", "Sampling profiler",
      "Writes where CPU time goes to eden.log every 10 s. Costs a little speed.", "debug",
      {{"off", "Off"}, {"on", "On"}}},
@@ -252,7 +260,7 @@ const char* OptionValue(std::string_view key) {
 }
 
 void LoadOptions() {
-    FILE* file = fopen("/data/EdenPS4/ps4.ini", "r");
+    FILE* file = fopen(Ps4Paths::Ini, "r");
     if (!file) return;
     char line[256];
     while (fgets(line, sizeof(line), file)) {
@@ -272,7 +280,7 @@ void LoadOptions() {
 }
 
 bool SaveOptions() {
-    FILE* file = fopen("/data/EdenPS4/ps4.ini", "w");
+    FILE* file = fopen(Ps4Paths::Ini, "w");
     if (!file) return false;
     for (const Option& option : g_options)
         fprintf(file, "%s=%s\n", option.key, option.values[option.current].first);
@@ -289,6 +297,7 @@ void ApplyOptions() {
                                                                 : Settings::ConsoleMode::Handheld);
     Common::PS4Diagnostics::output_1080 = std::string_view{OptionValue("output")} == "1080";
     Common::PS4Diagnostics::profiler = enabled("profile");
+    Common::PS4Diagnostics::framelog = enabled("framelog");
     Settings::values.renderer_backend.SetValue(std::string_view{OptionValue("renderer")} == "null"
                                                    ? Settings::RendererBackend::Null
                                                    : Settings::RendererBackend::Vulkan);
@@ -537,7 +546,7 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
     const auto result = system.Load(window, game.path, parameters);
     if (result != Core::SystemResultStatus::Success) {
         LOG_ERROR(Frontend, "Eden load failed: status={:#x}, path={}", u32(result), game.path);
-        throw std::runtime_error{"Could not load this file. See /data/EdenPS4/eden.log"};
+        throw std::runtime_error{"Could not load this file. See /data/ACNH/logs/eden.log"};
     }
     // The HOME menu's title and icon for this game, from the loader Eden has now anyway.
     if (!game.renderer) {
@@ -568,7 +577,7 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
     auto next_status = std::chrono::steady_clock::now() + std::chrono::seconds{10};
     constexpr uint32_t exit_buttons = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3 | ORBIS_PAD_BUTTON_OPTIONS;
     // Hang watchdog: if this loop stops, or frames stop after they had started, write every named thread's
-    // stack once to /data/EdenPS4/hang.log (no guest memory is touched, so it works while emulation is stuck).
+    // stack once to /data/ACNH/logs/hang.log (no guest memory is touched, so it works while emulation is stuck).
     std::atomic<u64> frontend_ticks{0};
     std::atomic<bool> watchdog_stop{false};
     std::thread watchdog([&] {
@@ -585,7 +594,7 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
             last_composites = composites;
             if (!dumped && (frontend_stale >= 15 || frames_stale >= 20)) {
                 dumped = true;
-                ps4_dump_thread_stacks("/data/EdenPS4/hang.log",
+                ps4_dump_thread_stacks(Ps4Paths::HangLog,
                                        frontend_stale >= 15 ? "frontend loop stopped for 15 s" : "no new frame for 20 s");
             }
         }
@@ -653,8 +662,8 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
 
 // ---- HOME menu ---------------------------------------------------------------------------------
 
-constexpr char UiStatePath[] = "/data/EdenPS4/ui-state.ini";
-constexpr char AvatarDir[] = "/data/EdenPS4/nand/system/save/8000000000000010/su/avators/";
+constexpr const char* UiStatePath = Ps4Paths::UiState;
+constexpr char AvatarDir[] = "/data/ACNH/nand/system/save/8000000000000010/su/avators/";
 
 std::vector<uint8_t> ReadFile(const std::string& path) {
     std::vector<uint8_t> data;
@@ -727,6 +736,25 @@ public:
     }
 
     const Game& Internal(int index) const { return internal[index]; }
+
+    /// The one game this fork boots on its own: ACNH, matched by title id once the metadata
+    /// reader has it, and by file name before that (the game file names carry the id).
+    /// Returns an index into internal/games, which RefreshGames keeps in lockstep, or -1.
+    int AutoLaunchTarget() const {
+        const size_t count = std::min(games.size(), internal.size());
+        for (size_t i = 0; i < count; ++i)
+            if (games[i].program_id == Ps4Paths::GameTitleId) return int(i);
+        for (size_t i = 0; i < count; ++i) {
+            std::string name = games[i].file;
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return char(std::tolower(c)); });
+            if (name.find("01006f8002326000") != std::string::npos ||
+                name.find("animal crossing") != std::string::npos) {
+                return int(i);
+            }
+        }
+        return -1;
+    }
 
     void Played(int index) {
         const std::string file = internal[index].name;
@@ -829,14 +857,14 @@ public:
                 {"CPU", fmt::format("{} cores, {} MHz", sysconf(_SC_NPROCESSORS_ONLN), sceKernelGetCpuFrequency() / 1000000)},
                 {"Memory for games", fmt::format("{} MiB direct memory", sceKernelGetDirectMemorySize() >> 20)},
                 {"Current user", user},
-                {"Data folder", "/data/EdenPS4"}};
+                {"Data folder", Ps4Paths::Root}};
     }
 
     std::vector<std::pair<std::string, std::string>> FilesInfo() override {
         struct stat status{};
-        const bool keys = stat("/data/EdenPS4/keys/prod.keys", &status) == 0;
+        const bool keys = stat("/data/ACNH/keys/prod.keys", &status) == 0;
         bool firmware = false;
-        if (DIR* directory = opendir("/data/EdenPS4/nand/system/Contents/registered")) {
+        if (DIR* directory = opendir("/data/ACNH/nand/system/Contents/registered")) {
             while (const auto* entry = readdir(directory))
                 if (entry->d_name[0] != '.') { firmware = true; break; }
             closedir(directory);
@@ -1050,7 +1078,21 @@ void Launcher(OrbisFrontend::Controller& controller) {
         auto last = std::chrono::steady_clock::now();
         int launch = -1;
         u64 frames = 0;
+        bool autolaunch_pending = std::strcmp(OptionValue("autolaunch"), "1") == 0;
         while (true) {
+            // Single-game fork: boot ACNH without showing the menu, unless the flag is off.
+            if (autolaunch_pending && frames == 0) {
+                autolaunch_pending = false;
+                const int target = host.AutoLaunchTarget();
+                if (target >= 0) {
+                    LOG_INFO(Frontend, "Auto-launch: booting {} ({})",
+                             host.Games()[target].path, host.Games()[target].file);
+                    launch = target;
+                    break;
+                }
+                LOG_WARNING(Frontend, "Auto-launch: no Animal Crossing file in {}, showing the menu",
+                            Ps4Paths::Games);
+            }
             controller.Read();
             const auto now = std::chrono::steady_clock::now();
             const float dt = std::clamp(std::chrono::duration<float>(now - last).count(), 0.0f, 0.1f);
@@ -1098,12 +1140,18 @@ void Launcher(OrbisFrontend::Controller& controller) {
 }
 
 int main() {
-    mkdir("/data/EdenPS4", 0777);
-    mkdir("/data/EdenPS4/games", 0777);
+    // This fork keeps everything under its own root so a normal Eden4 install is unaffected.
+    mkdir(Ps4Paths::Root, 0777);
+    mkdir(Ps4Paths::Games, 0777);
+    mkdir(Ps4Paths::Keys, 0777);
+    mkdir(Ps4Paths::Cache, 0777);
+    mkdir(Ps4Paths::ShaderCache, 0777);
+    mkdir(Ps4Paths::UiCache, 0777);
+    mkdir(Ps4Paths::Logs, 0777);
     SetDefaults();
     Common::Log::Initialize();
     Common::Log::Start();
-    LOG_INFO(Frontend, "Eden4 {} starting", Version);
+    LOG_INFO(Frontend, "eden4-acfork {} starting (Animal Crossing: New Horizons only)", Version);
     LOG_INFO(Frontend, "Host CPU: {}, AVX={}, AVX2={}, page size={}",
              Common::g_cpu_caps.cpu_string, Common::g_cpu_caps.avx,
              Common::g_cpu_caps.avx2, sysconf(_SC_PAGESIZE));

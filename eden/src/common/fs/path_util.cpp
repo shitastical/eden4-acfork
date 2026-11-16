@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <sys/stat.h> // mkdir, for the PS4 data root
 #include <sstream>
 #include "common/container/unordered_map.h"
 
@@ -18,6 +19,7 @@
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/ps4_paths.h"
 
 #ifdef _WIN32
 #include <shlobj.h> // Used in GetExeDirectory()
@@ -128,7 +130,11 @@ public:
         LEGACY_PATH(Suyu, SUYU)
 #undef LEGACY_PATH
 #elif defined(__OPENORBIS__)
-        eden_path = "/data/EdenPS4";
+        // Everything this fork writes lives under Ps4Paths::Root; a normal Eden4 keeps
+        // /data/EdenPS4, so both apps can be installed without sharing anything.
+        mkdir(Ps4Paths::Root, 0777);
+        mkdir(Ps4Paths::Cache, 0777);
+        eden_path = Ps4Paths::Root;
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;
 #elif __ANDROID__
@@ -350,7 +356,7 @@ fs::path GetAppDataRoamingDirectory() {
 
 fs::path GetHomeDirectory() {
 #ifdef __OPENORBIS__
-    return "/data/EdenPS4";
+    return Ps4Paths::Root;
 #else
     const char* home_env_var = getenv("HOME");
 

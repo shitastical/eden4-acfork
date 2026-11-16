@@ -6,7 +6,10 @@ only title this port cares about.
 
 Status at the time of writing: the game launches, loads, gets in-game, and survives
 character creation. Long-session stability is still being measured — see
-[Run C](#runs).
+[Run C](#runs) — and the JIT code-cache regression that killed the last build is
+fixed and documented in [Run G](#run-g--the-code-cache-regression). The tree is now
+the standalone `eden4-acfork` package described in
+[its own section](#this-fork-eden4-acfork).
 
 ## The console
 
@@ -16,11 +19,12 @@ character creation. Long-session stability is still being measured — see
 | Guest DRAM requested | 4096 MiB originally, then 3840, **3648 MiB now** (see below) |
 | Guest RAM placement | `0x20002c000`, software page tables |
 | FTP | `ftp://<console>:2121`, anonymous, GoldHEN |
-| Installed app | `/user/app/EDEN00002/` — `app.pkg` (65,536,000 B), `app.pbm`, `app.json`, `app.xml` |
-| Package | `EDEN00002`, content id `IV0000-EDEN00002_00-EDEN400000000000` |
-| Game file | `/data/EdenPS4/games/Animal Crossing New Horizons [01006F8002326000][US][v0].nsp` (6,694,761,920 B) |
-| Settings | `/data/EdenPS4/ps4.ini` |
-| Shader cache | `/data/EdenPS4/cache/shader/01006f8002326000/` |
+| Installed app | `/user/app/CUSA23260/` — `app.pkg` (68,681,728 B), `app.pbm`, `app.json`, `app.xml` |
+| Package | `CUSA23260`, content id `IV0000-CUSA23260_00-ACNH000000000000` |
+| Game file | `/data/ACNH/games/Animal Crossing New Horizons [01006F8002326000][US][v0].nsp` (6,694,761,920 B) |
+| Settings | `/data/ACNH/ps4.ini` |
+| Shader cache | `/data/ACNH/cache/shader/01006f8002326000/` |
+| Logs | `/data/ACNH/logs/eden.log`, `frames.log`, `hang.log`, `crash.log` |
 
 ## Where the 4608 MiB goes
 
@@ -40,6 +44,52 @@ allocation — competes for what is left:
 `ps4_heap_set_overflow_gpu_reserve()` (`yuzu_ps4/main.cpp`) decides how much of the
 remainder the C heap is forbidden to touch. That single constant turned out to be
 the whole bug.
+
+## This fork: `eden4-acfork`
+
+This tree is no longer a general Eden4: it is a single-game package for ACNH that
+can be installed **alongside** a stock Eden4 install because it shares no state
+with it.
+
+| Thing | Value | Why |
+|---|---|---|
+| Package name | `eden4-acfork` | distro/pkg filename, no spaces |
+| App title | `Animal Crossing: New Horizons` | what the XMB shows |
+| Title id | `CUSA23260` | must match `^[A-Z]{4}[0-9]{5}$`; taken from the game's own id so it reads as ACNH |
+| Content id | `IV0000-CUSA23260_00-ACNH000000000000` | `ACNH` label, padded to 16 |
+| Icon / banner | `branding/icon0.png` (512x512 RGBA), `branding/pic1.png` (1920x1080) | generated from the desktop art by `build.sh` arguments |
+| Data root | `/data/ACNH` | stock Eden4 keeps `/data/EdenPS4`, so the two never collide |
+
+Every path is defined once, in `eden/src/common/ps4_paths.h`; nothing else in the
+tree hardcodes a data path. The layout is shaped for FTP browsing:
+
+```
+/data/ACNH/
+  ps4.ini            settings (same keys as the launcher's menu; hand-editable)
+  ui-state.ini       home-menu cursor position
+  games/             the Animal Crossing NSP/XCI goes here and nowhere else
+  keys/              prod.keys, title.keys
+  nand/              save data, system titles, firmware
+  cache/shader/      translated GPU pipelines (survives reinstall)
+  cache/ui/          cached menu icons and metadata
+  logs/              eden.log, frames.log, hang.log, crash.log
+```
+
+**Auto-launch.** `autolaunch=1` (the default, and what is set on the console) boots
+the game in `games/` as soon as the app starts: the launcher scans, matches the
+played file against `Ps4Paths::GameTitleId` (falling back to `01006f8002326000` or
+"animal crossing" in the file name before the metadata reader has run), and skips
+the menu entirely. If no matching file is found it logs a warning and shows the
+normal menu instead of failing. To reach the emulator menus, set `autolaunch=0` in
+`/data/ACNH/ps4.ini` (or turn it off under Display in System Settings inside the
+app) and restart.
+
+**Per-frame log.** `framelog=1` (default) appends `frame,gap_ms` to
+`logs/frames.log` from `Swapchain::Present` — the wall-clock gap since the previous
+presented frame, i.e. the same number the 10 s heartbeat averages, but per frame, so
+a hitch can be located exactly. It is buffered (one flush per 120 frames) and capped
+at 8 MiB, after which the old file is renamed to `frames.previous.log`. The verbose
+`eden.log` still carries the heartbeat lines (`PS4 performance: game X fps, ...`).
 
 ## The crash
 
@@ -122,6 +172,32 @@ without a profiler running (the profiler itself costs frame rate).
 
 Expected: ~450 MiB of contiguous free direct memory. Awaiting a long test. Only the
 applet pool gives anything up; the application pool is still 3285 MiB.
+
+### Run G — the code cache regression
+
+The first `eden4-acfork` build died differently from every run above: not after
+minutes of heap growth, but on the **fourth** JIT core coming up, before the game
+even drew a frame.
+
+```
+PS4 JIT allocation of 98320 KiB failed: 0x8002000c
+terminate called after throwing an instance of 'std::bad_alloc'
+... signal 6
+```
+
+`0x8002000c` is `SCE_ENOMEM`, and 98320 KiB is `96 MiB + 16 KiB` of Dynarmic code
+cache per core. The JIT caches come out of **flexible** memory, and with guest RAM at
+3648 MiB the ledger cannot seat four 96 MiB blocks (384 MiB) next to everything else
+— the fourth allocation is simply refused. The clear/perf experiment that raised the
+cache to 96 MiB was therefore a regression, not a tuning knob: it traded a
+one-in-a-hundred cost (`mprotect` after six clears, 9.7 s total) for a guaranteed
+crash on boot.
+
+Fix: `code_cache_size` is back to `64_MiB` in
+`core/arm/dynarmic/arm_dynarmic_64.cpp`, next to a comment stating why it must not be
+raised without shrinking guest RAM first. The FP inaccuracy flags
+(`Unsafe_ReducedErrorFP`, `Unsafe_InaccurateNaN`, only under `Auto` and only for
+`__OPENORBIS__`) are kept — they do not allocate and cannot cause this.
 
 ## Shrinking guest RAM, and the trap in it
 
@@ -241,7 +317,7 @@ unshare -rm /path/to/ps4ns.sh bash -c '
   source runtime/scripts/ps4-env.sh
   unset LDFLAGS CFLAGS CXXFLAGS CPPFLAGS LIBS
   ninja -C "$PS4_BUILD_ROOT/build/eden" eden-ps4_eboot -j6'
-bash eden/ps4/build.sh --no-configure      # packages Eden4-<version>.pkg
+bash eden/ps4/build.sh --no-configure      # packages eden4-acfork-<version>.pkg
 ```
 
 The `unset` matters: `build.sh` re-sources `ps4vars.sh`, which re-exports `LDFLAGS`,
@@ -251,6 +327,20 @@ sidesteps it.
 
 Then, over FTP: upload the pkg to `/data/pkg/`, install on the console, launch.
 `check-oelf.py` should report `PASS` and every package digest should read `OK`.
+The output is `~/eden4-build/out/eden4-acfork-01.00.pkg` (68,681,728 B for this
+build); it installs next to a stock Eden4 package with no shared data.
+
+First-run setup on a console that already ran the old build (done once, scripted over
+FTP; renames, so the 6.2 GB game file moves instantly):
+
+```
+mkdir /data/ACNH/{games,keys,nand,cache/shader,cache/ui,logs}
+rename /data/EdenPS4/games/<game>.nsp  -> /data/ACNH/games/<game>.nsp
+rename /data/EdenPS4/nand              -> /data/ACNH/nand            # keeps the save
+rename /data/EdenPS4/cache/shader/*    -> /data/ACNH/cache/shader/*  # keeps 430 pipelines
+copy   /data/EdenPS4/keys/*            -> /data/ACNH/keys/*          # copied, old install stays valid
+write  /data/ACNH/ps4.ini              = autolaunch=1 / docked=0 / output=720 / framelog=1
+```
 
 ### Build problems already solved — don't rediscover them
 
@@ -295,8 +385,9 @@ in `yuzu_ps4/main.cpp`.
 
 430 pipelines read back from disk in ~89 ms, and the word "compil" appears exactly
 once in the entire log — an unrelated `Storage buffer failed to track` warning. The
-cache files persist at `/data/EdenPS4/cache/shader/01006f8002326000/`
-(`vulkan.bin` 2.5 MB, `vulkan_pipelines.bin` 986 KB).
+cache files persist at `/data/ACNH/cache/shader/01006f8002326000/`
+(`vulkan.bin` 2.5 MB, `vulkan_pipelines.bin` 986 KB). They were moved there from the
+old data root, unchanged, when this fork took over — so the cache is already warm.
 
 What "shader compilation" actually costs here is *first-ever* pipelines: anything not
 yet in the 430 compiles synchronously the first time it is drawn, which is a hitch,
@@ -376,13 +467,13 @@ The three remaining candidates, in order of expected value:
 
 ## Iterating on the console
 
-There is no hot-swap path for code. `/user/app/EDEN00002/` holds only `app.pkg`
-(a PFS image), and `/user/patch/EDEN00002/` does not exist — the executable is
+There is no hot-swap path for code. `/user/app/CUSA23260/` holds only `app.pkg`
+(a PFS image), and `/user/patch/CUSA23260/` does not exist — the executable is
 loaded from the image before any GoldHEN plugin can redirect it. GoldHEN's AFR
 plugin can substitute *data* files opened at runtime, which is useful for
 `ps4.ini` and caches but not for the binary.
 
-So every code change is: rebuild → package → FTP the 65,536,000-byte pkg → install.
+So every code change is: rebuild → package → FTP the 68,681,728-byte pkg → install.
 `ps4.ini` and the shader cache *can* be edited live over FTP.
 
 Operational notes that cost time before:
@@ -391,5 +482,44 @@ Operational notes that cost time before:
   multi-GB files. `550 File unavailable` on `RNFR` means the source path is wrong.
 - `awk '{print $NF}'` truncates filenames containing spaces, which silently breaks
   anything reasoning about the ACNH NSP.
-- Uninstalling the app does not touch `/data/EdenPS4/` — the NSP, `ps4.ini` and the
-  shader cache all survive it.
+- Uninstalling the app does not touch `/data/ACNH/` — the NSP, `ps4.ini`, the save
+  and the shader cache all survive it, which is also why reinstalling this fork keeps
+  its save.
+- The fork and a stock Eden4 install are independent: different title ids, different
+  data roots. Uninstalling one leaves the other's data untouched.
+- Auto-launch can hide the menus completely; if a build seems to "hang" on a black
+  screen, check `logs/eden.log` for `Auto-launch: booting ...` before assuming a
+  crash, and set `autolaunch=0` to get the menu back.
+
+## Run H — the standalone build
+
+What changed in this build, relative to Run F (the last one that ran on hardware):
+
+| Change | Reason | Risk |
+|---|---|---|
+| `code_cache_size` 96 MiB -> 64 MiB | 4 x 96 MiB of flexible memory does not fit; Run G crashed with `SCE_ENOMEM` on the 4th core | none; this is the value every earlier run used |
+| FP inaccuracy flags kept | free ARM64 speed, no allocation | none seen before Run G, which failed on allocation |
+| Package identity `CUSA23260`, title `Animal Crossing: New Horizons` | standalone fork, side by side with stock Eden4 | none |
+| Data root `/data/ACNH` (+ moved NSP, nand, shader cache) | keeps both installs' state separate | none; renames, save and 430 pipelines preserved |
+| `autolaunch=1` default | boot straight into the game | none; falls back to the menu when no ACNH file is found |
+| `framelog=1` default | per-frame `frame,gap_ms` for offline analysis | one buffered line per frame |
+
+Build facts for this pkg: `eden4-acfork-01.00.pkg`, 68,681,728 B, `check-oelf` PASS,
+all 28 package digests `OK`, uploaded to `/data/pkg/`. Console state: prepared and
+verified over FTP (tree, NSP, nand, shader cache, keys, `ps4.ini`).
+
+**Not yet measured:** this build has not been launched on the console yet — a pkg
+cannot be installed over FTP, so that step is manual (Install Package on the console).
+The first run is the decisive check for Run G, and the numbers to compare against
+Run F are:
+
+| Metric | Run F (before) | Where to read it |
+|---|---|---|
+| Survives boot | n/a | no `signal 6` in `crash.log`; `Auto-launch: booting ...` in `eden.log` |
+| Frame time | 42.8-98.2 ms / 13.4-19.9 fps | `PS4 performance: game X fps ...` every 10 s |
+| Frame pacing | unknown | `frames.log`: `awk -F, 'NR>1 && $2>40' | wc -l` counts frames over 40 ms |
+| Shader cache | 430 pipelines in ~89 ms | `LoadDiskResources: Total Pipeline Count` |
+| Display wait | 0.0 ms/frame | same perf line |
+
+For a pacing distribution: `sort -t, -k2 -n frames.log | tail` gives the worst frames
+and `awk -F, 'NR>1{s+=$2;n++}END{print s/n}' frames.log` the mean gap.

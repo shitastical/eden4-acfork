@@ -21,6 +21,8 @@ inline std::atomic<bool> inline_memory{true};
 inline std::atomic<bool> direct_table{true};
 // Sampling profiler (ps4_sampler.cpp); off by default, ps4.ini "profile=on" enables it.
 inline std::atomic<bool> profiler{false};
+// ps4.ini "framelog=1" (default): one line per presented frame in /data/ACNH/logs/frames.log.
+inline std::atomic<bool> framelog{true};
 // Guest memory accesses that left the JIT's inline page table walk (one 64-byte slot per core).
 inline u64 memory_callbacks[4][8]{};
 inline u64 MemoryCallbackTotal() {

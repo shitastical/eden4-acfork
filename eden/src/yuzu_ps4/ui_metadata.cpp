@@ -3,11 +3,12 @@
 #include <cstdio>
 #include <sys/stat.h>
 #include "common/logging.h"
+#include "common/ps4_paths.h"
 #include "yuzu_ps4/ui_metadata.h"
 
 namespace OrbisFrontend {
 namespace {
-constexpr char CacheDir[] = "/data/EdenPS4/cache/ui";
+constexpr const char* CacheDir = Ps4Paths::UiCache;
 constexpr uint32_t CacheMagic = 0x31554445; // "EDU1"
 
 uint64_t Hash(const Metadata::Entry& entry) {
@@ -53,7 +54,8 @@ bool ReadCache(const std::string& path, Info& info) {
 }
 
 void WriteCache(const std::string& path, const Info& info) {
-    mkdir("/data/EdenPS4/cache", 0777);
+    mkdir(Ps4Paths::Cache, 0777);
+    mkdir(Ps4Paths::UiCache, 0777);
     mkdir(CacheDir, 0777);
     FILE* file = fopen(path.c_str(), "wb");
     if (!file) return;

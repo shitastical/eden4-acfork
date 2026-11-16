@@ -11,6 +11,7 @@
 #include "common/alignment.h"
 #include "common/logging.h"
 #include "common/ps4_diagnostics.h"
+#include "common/ps4_paths.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -20,6 +21,45 @@
 extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
 
 namespace Vulkan {
+namespace {
+
+// ps4.ini framelog=1 (the default): one line per presented frame, "frame,gap_ms", where gap_ms is
+// the wall-clock time since the previous frame. This is the number the perf line averages every
+// 10 s, but per frame, so hitches and their first occurrence are visible offline. Buffered writes
+// (one flush per 120 frames) and a 8 MiB cap keep it cheap and bounded.
+void LogFrame(u64 frame) {
+    static FILE* file = nullptr;
+    static std::chrono::steady_clock::time_point previous{};
+    static u64 pending = 0;
+    if (!Common::PS4Diagnostics::framelog) return;
+    if (file == nullptr) {
+        constexpr long Limit = 8 * 1024 * 1024;
+        if (FILE* existing = fopen(Ps4Paths::FrameLog, "rb")) {
+            fseek(existing, 0, SEEK_END);
+            const long size = ftell(existing);
+            fclose(existing);
+            if (size > Limit) {
+                rename(Ps4Paths::FrameLog, "/data/ACNH/logs/frames.previous.log");
+            }
+        }
+        file = fopen(Ps4Paths::FrameLog, "a");
+        if (file == nullptr) return;
+        fprintf(file, "# frame,gap_ms\n");
+        fflush(file);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (previous != std::chrono::steady_clock::time_point{}) {
+        const double gap = std::chrono::duration<double, std::milli>(now - previous).count();
+        fprintf(file, "%llu,%.2f\n", static_cast<unsigned long long>(frame), gap);
+        if (++pending >= 120) {
+            fflush(file);
+            pending = 0;
+        }
+    }
+    previous = now;
+}
+
+} // namespace
 namespace {
 constexpr u32 BufferCount = 3;
 constexpr VkDeviceSize BufferAlignment = 2 * 1024 * 1024;
@@ -240,6 +280,7 @@ void Swapchain::Present(VkSemaphore) {
     ps4->last_flip[image_index] = argument;
     const auto flip = ++Common::PS4Diagnostics::flips;
     ++Common::PS4Diagnostics::presented_frames;
+    LogFrame(flip);
     if (flip <= 3) {
         LOG_INFO(Render_Vulkan, "PS4 VideoOut flip {} submitted: buffer={}, argument={}, {}",
                  flip, image_index, argument, ps4->gpu_flips ? "queued on the GPU" : "after GPU idle");

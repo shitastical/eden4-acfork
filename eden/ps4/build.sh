@@ -9,10 +9,18 @@ BUILD="${EDEN_PS4_BUILD:-$PS4_BUILD_ROOT/build/eden}"
 STAGE="$BUILD/stage"
 OUT="$PS4_BUILD_ROOT/out"
 
-NAME="Eden4"
+NAME="eden4-acfork"
 VERSION="${EDEN4_VERSION:-01.00}"   # PKG version, XX.YY
-# EDEN00002 replaces the Eden PS4 test builds in place; the app keeps its data in /data/EdenPS4.
-TITLE_ID="${EDEN4_TITLE_ID:-EDEN00002}"
+# This fork is its own application, not a replacement for Eden4: CUSA23260 is free to use and
+# never collides with EDEN00002, so both can be installed at once. The ACNH tail of the game's
+# own title id (01006F8002326000) is what the digits spell. make-pkg.sh requires AAAA99999.
+TITLE_ID="${ACNH_TITLE_ID:-CUSA23260}"
+# Shown on the PS4 home screen. Kept out of NAME so the package filename stays space-free.
+APP_TITLE="${ACNH_APP_TITLE:-Animal Crossing: New Horizons}"
+# Content-id label, padded by make-pkg.sh: IV0000-CUSA23260_00-ACNH000000000000
+CONTENT_LABEL="${ACNH_CONTENT_LABEL:-ACNH}"
+# Eden4's data lives in /data/EdenPS4; this fork uses /data/ACNH so the two never share settings.
+APP_DATA_DIR="${ACNH_DATA_DIR:-/data/ACNH}"
 
 if [ "${1:-}" != --no-configure ]; then "$HERE/configure.sh"; fi
 cmake --build "$BUILD" --target eden-ps4_eboot -j"$JOBS"
@@ -27,7 +35,7 @@ if [ "${EDEN4_SELF_TEST:-0}" = 1 ]; then
     "$HERE/build-cpu-smoke.sh" "$STAGE/homebrew"
     rm -f "$STAGE/homebrew/cpu-smoke.o"
 fi
-cp "$REPO/LICENSE" "$STAGE/licenses/Eden4-GPL-3.0.txt"
+cp "$REPO/LICENSE" "$STAGE/licenses/eden4-acfork-GPL-3.0.txt"
 cp "$DOLPHIN_PS4_ROOT/LICENSE" "$STAGE/licenses/Runtime-GPL-2.0.txt"
 cp "$DOLPHIN_PS4_ROOT/fonts/Nunito-OFL.txt" "$STAGE/licenses/Nunito-OFL.txt"
 cp "$REPO/CREDITS.md" "$STAGE/licenses/CREDITS.md"
@@ -62,7 +70,7 @@ PY
 ATTRIBUTE="${EDEN_SFO_ATTRIBUTE:-0}"
 SUFFIX="${EDEN_PKG_SUFFIX:-}"
 PKG="$(INCLUDE_PIGLET_MODULES=0 SFO_STYLE=plain SFO_ATTRIBUTE="$ATTRIBUTE" "$DOLPHIN_PS4_ROOT/scripts/make-pkg.sh" \
-    "$STAGE" "$TITLE_ID" "$NAME" "$VERSION" EDEN4 "$OUT" | tail -1)"
+    "$STAGE" "$TITLE_ID" "$APP_TITLE" "$VERSION" "$CONTENT_LABEL" "$OUT" | tail -1)"
 export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 "$OPENORBIS/bin/linux/PkgTool.Core" pkg_validate "$PKG"
 FINAL="$OUT/$NAME-$VERSION$SUFFIX.pkg"

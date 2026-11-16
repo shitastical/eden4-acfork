@@ -7,6 +7,8 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+
+#include "common/ps4_paths.h"
 #include <cstdlib>
 #include <cerrno>
 #include <mutex>
@@ -307,10 +309,11 @@ private:
 #else
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path&) noexcept {
-        mkdir("/data/EdenPS4", 0777);
-        rename("/data/EdenPS4/eden.log", "/data/EdenPS4/eden.previous.log");
-        fd = open("/data/EdenPS4/eden.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        for (const char* path : {"/mnt/usb0/EdenPS4-eden.log", "/mnt/usb1/EdenPS4-eden.log"}) {
+        mkdir(Ps4Paths::Root, 0777);
+        mkdir(Ps4Paths::Logs, 0777);
+        rename(Ps4Paths::Log, "/data/ACNH/logs/eden.previous.log");
+        fd = open(Ps4Paths::Log, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        for (const char* path : {"/mnt/usb0/ACNH-eden.log", "/mnt/usb1/ACNH-eden.log"}) {
             usb = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
             if (usb >= 0) break;
         }
