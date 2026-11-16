@@ -50,6 +50,12 @@ inline std::atomic<u64> audio_buffers{};
 // "guest CPU" and "graphics" without a profiler running.
 inline std::atomic<u64> buffer_wait_us{};
 inline std::atomic<u64> gpu_idle_us{};
+// Guest atomics per window (dynarmic's exclusive monitor, see ps4_count_exclusive): LDXR, STXR and
+// the STXR that lost its reservation. Every one of them is a host call into the monitor plus a guest
+// memory access shared by the three cores, so the rate sizes that part of a slow frame.
+inline std::atomic<u64> exclusive_reads{};
+inline std::atomic<u64> exclusive_writes{};
+inline std::atomic<u64> exclusive_failures{};
 inline std::atomic<u64> presented_frames{};
 inline std::atomic<const char*> stage{"waiting for guest display"};
 

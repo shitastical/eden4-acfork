@@ -925,3 +925,114 @@ control. The levers the numbers do support, in order:
 2. **Compile less per guest instruction** — emit is 22.5% of the critical thread; the
    hot addresses are inside Xbyak and dynarmic's label bookkeeping.
 3. **Stream better** — fixes the collapse, not the plateau.
+
+## Run M — the atomics, not the page walk
+
+Run L left three levers. This run attacks the first one properly, and the result is
+that lever 1 was misdiagnosed: a guest load/store in this build is **not** our top cost
+in a 30 fps window. The top cost that *is* ours is the guest's atomics.
+
+### Why the page walk cannot be made cheaper (checked, then dropped)
+
+The two-level table walk per access is 13 uops and two dependent loads
+(`EmitVAddrLookup`). The obvious trims are all real options, and all of them are either
+useless here or a correctness gamble:
+
+- **Dense chunk table so the null-chunk test can go.** A chunk covers
+  `2^chunk_bits` pages; the guest needs 39-bit VAs, so a dense table is 1 GiB at any
+  chunk size that fits a page table we would still call two-level. Rejected.
+- **Wider loads.** The hot loops are `ldrb/strb` (`0x823939a4`), `ldr/str` (`0x823d2b58`)
+  and `stp`-style `memset` (`0x850ad904`); merging them is rewriting the guest, not the
+  translator. Rejected in Run L as a graft.
+- **Drop the range test or the misalignment test.** `only_detect_misalignment` already
+  keeps the misalignment test off 8/16-byte accesses, and the range test is what stops
+  an out-of-space address from reaching the host. Removing either changes what an
+  invalid guest access does, which is exactly the class of change that ends in a kernel
+  panic on this console. Rejected on the "nothing breaks" rule.
+
+One uop is recoverable in principle (computing the chunk index as
+`vaddr >> (12 + chunk_bits)` instead of `(vaddr >> 12) >> chunk_bits`), but it saves a
+single cycle on a path that is dominated by the two dependent loads, so it is not worth
+touching the emitter for.
+
+### What the 30 fps windows actually spend on us
+
+From the per-window symbolization, the largest **self-inflicted** group in plateau
+windows is the exclusive/atomic path: `Dynarmic::SpinLock::Unlock` alone was 2.3% of a
+window, and `ExclusiveMonitor::CheckAndClear`, `Memory::WriteExclusive32`,
+`Memory::ReadExclusive32`, `GetPointerImpl`, `CheckMemoryAccess` and the
+`DynarmicExclusiveWriteMemory<32>` lambdas push the group to roughly 8–11% of wall time
+on core 0. In one line: **the guest's atomics cost more than the guest's loads.**
+
+The cause is that `fastmem_exclusive_access` is false on this port (there is no fastmem
+arena to point at), so every `LDXR`/`STXR` becomes a host call into the monitor, and the
+monitor took a *process-wide* lock for each one — twice per pair, three cores at once.
+Worse, the lock itself was not cheap:
+
+- `SpinLock::Lock` was `std::call_once(...)` plus an **indirect call** into
+  JIT-generated code, because the handler was emitted rather than compiled.
+- `SpinLock::Unlock` emitted `xor; xchg [ptr], eax; mfence` — the `mfence` is redundant
+  after a locked `xchg`, which is already a full barrier.
+- `ReadAndMark` called the guest's load **inside the lock**, so a guest `LDXR` held the
+  shared lock across a page walk and a guest memory read.
+
+### The change
+
+Four edits, each one argued from the semantics it has to preserve.
+
+1. `dynarmic/common/spin_lock_x64.cpp` — `SpinLock::Lock/Unlock` are now an inline
+   test-and-test-and-set: one `lock xchg` (acquire) in the uncontended case, a
+   `pause`-padded read loop before the retry, and a plain release store to unlock
+   (`xchg` is already a full barrier). The `std::call_once`, the indirect call, the
+   one-time code generation and the `mfence` are gone. `EmitSpinLockLock/Unlock` are
+   untouched — they are still what the JIT's *inline* fastmem lock path emits, and this
+   build never reaches it; deleting them would be an unnecessary change.
+2. `dynarmic/interface/exclusive_monitor.h` — `ReadAndMark` performs the guest load
+   **before** taking the lock. The load was never part of the reservation: the value it
+   produces is only the "expected" operand of the paired `STXR`, and that store compares
+   against the value in memory *at the time of the store*, so a write landing between the
+   load and the mark can only make the store fail — or match, which is a perfectly valid
+   compare-and-swap. The lock now covers exactly the two stores that make up the
+   reservation, which is all it was ever needed for.
+3. `dynarmic/backend/x64/block_of_code.cpp` — `ClearCache()` logs the block count it is
+   about to throw away (`cache clear N with M blocks live`). Run L could only infer the
+   clears from a cumulative counter; this makes the re-translation cost of each flush
+   directly readable.
+4. `yuzu_ps4/main.cpp` + `common/ps4_diagnostics.h` + `core/arm/dynarmic` — the monitor
+   counts every guest atomic (reads, writes, and writes that lost their reservation) and
+   the 10 s status line reports them (`PS4 atomics: exclusive reads=… writes=… lost
+   reservation=…`). This is the measurement that decides the next step: it converts
+   "8–11% in the profile" into an ops/second figure we can multiply by a known cost.
+
+Nothing else changed. No scheduling, no timing, no memory-map, no rendering, no frame
+pacing, and no change to what a guest instruction computes.
+
+### What to look for in the log
+
+- `PS4 atomics: exclusive reads=… writes=… lost reservation=…` next to the fps line. If
+  reads+writes are in the hundreds of thousands per 10 s window, the path is worth
+  finishing (the remaining idea is to skip the monitor entirely for uncontended
+  single-threaded atomics); if they are a few thousand, it was never the problem and the
+  emitter is.
+- `lost reservation` as a fraction of writes. A large fraction means the guest is
+  spinning on real contention and each retry pays the path again.
+- `PS4 JIT …: cache clear N with M blocks live` at each flush, and the 10 s
+  `PS4 JIT` line. Comparing the two tells us exactly how much code an `IALLU` is making
+  us compile a second time.
+
+### The next lever, and why it is not in this build
+
+The plateau is now close to pinned: 29% guest memory access (cannot be made cheaper
+safely, above), 22.5% emitter, ~10% atomics (this run removes a good part of it). The
+load-phase collapse, though, is 100% translation, and translation only happens twice
+for the same guest code because a full `IC IALLU` throws the entire cache away. The fix
+is a **verified block cache**: keep the compiled block, stamp it with a flush epoch, and
+when a block from an older epoch is looked up, re-read its guest instruction words and
+compare a 128-bit hash of them; matching blocks keep executing, mismatching ones are
+unpatched and recompiled. Correctness is preserved by construction — a block is only
+reused if the guest bytes it was compiled from are provably unchanged, and anything that
+cannot be hashed exactly (a non-contiguous block) falls back to today's behaviour.
+
+That is a change to the JIT's invalidation core, and it needs dynarmic's own
+self-modifying-code tests run on the host before it goes anywhere near the console, so
+it is deliberately not folded into this measured run.

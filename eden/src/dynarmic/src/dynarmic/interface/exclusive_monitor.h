@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -20,6 +21,14 @@ namespace Dynarmic {
 
 using VAddr = std::uint64_t;
 using Vector = std::array<std::uint64_t, 2>;
+
+#ifdef __OPENORBIS__
+// Counting every guest atomic for the PS4 build's per-window stats (yuzu collects them). The JIT
+// calls the monitor directly, so this is the only place that sees all exclusive ops; the definition
+// lives in core/arm/dynarmic/arm_dynarmic_64.cpp. kind: 0 = exclusive read, 1 = exclusive write,
+// 2 = write that lost its reservation.
+extern "C" void ps4_count_exclusive(int kind);
+#endif
 
 class ExclusiveMonitor {
 public:
@@ -37,11 +46,21 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
 
+        // The load is not part of the reservation: it used to run inside the lock, so every guest
+        // LDXR held the shared monitor lock across a page table walk and a guest memory read,
+        // serialising the three cores. The value only becomes the "expected" for the paired STXR,
+        // and that store compares against memory at the time of the store, so a write that lands
+        // between this load and the mark can only fail the store (or match it, which is a valid
+        // compare-and-swap). Marking afterwards keeps the same reservation semantics.
+        const T value = op();
+
         Lock();
         exclusive_addresses[processor_id] = masked_address;
-        const T value = op();
         std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
         Unlock();
+#ifdef __OPENORBIS__
+        ps4_count_exclusive(0);
+#endif
         return value;
     }
 
@@ -52,7 +71,13 @@ public:
     template<typename T, typename Function>
         requires std::is_trivially_copyable_v<T>
     bool DoExclusiveOperation(size_t processor_id, VAddr address, Function op) {
+#ifdef __OPENORBIS__
+        ps4_count_exclusive(1);
+#endif
         if (!CheckAndClear(processor_id, address)) {
+#ifdef __OPENORBIS__
+            ps4_count_exclusive(2);
+#endif
             return false;
         }
 

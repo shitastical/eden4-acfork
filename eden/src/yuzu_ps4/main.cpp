@@ -647,6 +647,15 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
                      perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
                      static_cast<double>(wait_us) / 1000.0 * per_frame,
                      static_cast<double>(idle_us) / 1000.0 * per_frame, frames);
+            // Guest atomics for the same window. Each one is a host call into the exclusive monitor
+            // plus a guest memory access, and the whole path is shared by the three cores, so the
+            // rate here says how much of a slow frame could be this.
+            using Common::PS4Diagnostics::exclusive_reads;
+            using Common::PS4Diagnostics::exclusive_writes;
+            using Common::PS4Diagnostics::exclusive_failures;
+            LOG_INFO(Frontend, "PS4 atomics: exclusive reads={}, writes={}, lost reservation={}",
+                     exclusive_reads.exchange(0), exclusive_writes.exchange(0),
+                     exclusive_failures.exchange(0));
             if (Common::PS4Diagnostics::profiler)
                 DrainProfiler(system);
             next_status = std::chrono::steady_clock::now() + std::chrono::seconds{10};

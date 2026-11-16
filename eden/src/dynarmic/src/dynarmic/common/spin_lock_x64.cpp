@@ -6,19 +6,11 @@
  * SPDX-License-Identifier: 0BSD
  */
 
-#include <mutex>
-#include <optional>
 #include "dynarmic/backend/x64/xbyak.h"
 
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/hostloc.h"
 #include "dynarmic/common/spin_lock.h"
-
-#ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
-static const auto default_cg_mode = Xbyak::DontSetProtectRWE;
-#else
-static const auto default_cg_mode = nullptr; //Allow RWE
-#endif
 
 namespace Dynarmic {
 
@@ -75,49 +67,39 @@ void EmitSpinLockUnlock(Xbyak::CodeGenerator& code, Xbyak::Reg64 ptr, Xbyak::Reg
 }
 
 namespace {
-struct SpinLockImpl {
-    void Initialize() noexcept;
-    static void GlobalInitialize() noexcept;
-    Xbyak::CodeGenerator code = Xbyak::CodeGenerator(4096, default_cg_mode);
-    void (*lock)(volatile int*) = nullptr;
-    void (*unlock)(volatile int*) = nullptr;
-};
-
-std::once_flag flag;
-/// @brief Bear in mind that initializing the variable as-is on ctor time will trigger bugs
-/// because some OSes do not prepare mprotect() properly at static ctor time
-/// We can't really do anything about it, so just live with this fact
-std::optional<SpinLockImpl> impl;
-
-void SpinLockImpl::Initialize() noexcept {
-    // Needed for W^X systems (i.e SElinux, OpenBSD)
-    code.setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RW);
-    Xbyak::Reg64 const ABI_PARAM1 = Backend::X64::HostLocToReg64(Backend::X64::ABI_PARAM1);
-    code.align();
-    lock = code.getCurr<void (*)(volatile int*)>();
-    EmitSpinLockLock(code, ABI_PARAM1, code.eax, false);
-    code.ret();
-    code.align();
-    unlock = code.getCurr<void (*)(volatile int*)>();
-    EmitSpinLockUnlock(code, ABI_PARAM1, code.eax);
-    code.ret();
-    code.setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RE);
-}
-
-void SpinLockImpl::GlobalInitialize() noexcept {
-    impl.emplace();
-    impl->Initialize();
+inline void Pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#endif
 }
 }  // namespace
 
+// The exclusive monitor's lock is taken and released twice per guest atomic (LDXR/STXR pair), and
+// the guest runs those from three cores at once. This used to be three calls per acquisition --
+// std::call_once, then an indirect call into generated code that did `xchg` (lock) or
+// `xchg` + `mfence` (unlock) -- because the handlers were emitted rather than compiled. The
+// handlers are still emitted for the JIT's own inline fastmem lock path (EmitSpinLockLock), which
+// this build never uses: fastmem_exclusive_access is off without a fastmem arena. Doing the
+// uncontended case inline with one locked exchange and releasing with a plain release store (xchg
+// is already a full barrier, so no mfence) removes that call chain from every atomic op.
 void SpinLock::Lock() noexcept {
-    std::call_once(flag, &SpinLockImpl::GlobalInitialize);
-    impl->lock(&storage);
+    if (__atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE) == 0) {
+        return;
+    }
+    // Contended: spin on a read so the owners' cache line is not invalidated by every waiter, and
+    // only retry the exchange once it looks free.
+    while (true) {
+        while (__atomic_load_n(&storage, __ATOMIC_RELAXED) != 0) {
+            Pause();
+        }
+        if (__atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE) == 0) {
+            return;
+        }
+    }
 }
 
 void SpinLock::Unlock() noexcept {
-    std::call_once(flag, &SpinLockImpl::GlobalInitialize);
-    impl->unlock(&storage);
+    __atomic_store_n(&storage, 0, __ATOMIC_RELEASE);
 }
 
 }  // namespace Dynarmic

@@ -17,6 +17,19 @@
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
 
+#ifdef __OPENORBIS__
+// Every guest atomic, from dynarmic's exclusive monitor (declared in interface/exclusive_monitor.h).
+// Relaxed increments: the monitor's own locked exchange is the expensive part of that path, and this
+// is only read once per 10 s window.
+extern "C" void ps4_count_exclusive(int kind) {
+    switch (kind) {
+    case 0: Common::PS4Diagnostics::exclusive_reads.fetch_add(1, std::memory_order_relaxed); break;
+    case 1: Common::PS4Diagnostics::exclusive_writes.fetch_add(1, std::memory_order_relaxed); break;
+    default: Common::PS4Diagnostics::exclusive_failures.fetch_add(1, std::memory_order_relaxed); break;
+    }
+}
+#endif
+
 namespace Core {
 
 using namespace Common::Literals;

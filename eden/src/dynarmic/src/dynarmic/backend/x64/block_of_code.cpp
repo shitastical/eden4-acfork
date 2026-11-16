@@ -413,6 +413,14 @@ void BlockOfCode::ClearCache() {
     ASSERT(prelude_complete);
 #ifdef __OPENORBIS__
     ps4_clears++;
+    // A clear throws away every translation, so the blocks compiled since the last one are the work
+    // the guest has to pay for a second time if it re-enters that code. Logged here (not only in the
+    // periodic stats) so a run shows what each clear cost; blocks are cumulative, so the per-clear
+    // figure is the difference between two of these lines.
+    if (ps4_windows != 0) {
+        LOG_INFO(Core, "PS4 JIT {}: cache clear {} with {} blocks live",
+                 static_cast<const void*>(getCode()), ps4_clears, ps4_windows);
+    }
     // The guest asked for an instruction cache flush. Every translation is discarded, so the
     // sampler's host to guest block map has to go with them.
     ps4_sampler_reset_blocks();
