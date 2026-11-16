@@ -56,6 +56,13 @@ inline std::atomic<u64> gpu_idle_us{};
 inline std::atomic<u64> exclusive_reads{};
 inline std::atomic<u64> exclusive_writes{};
 inline std::atomic<u64> exclusive_failures{};
+// Kept-block cache across a guest instruction-cache flush: how many flushes kept their code, how
+// many blocks that saved, how many were proved unchanged on re-entry, and how many had to be
+// recompiled because the guest had really changed them.
+inline std::atomic<u64> block_reuse_flushes{};
+inline std::atomic<u64> block_reuse_kept{};
+inline std::atomic<u64> block_reuse_proven{};
+inline std::atomic<u64> block_reuse_recompiled{};
 inline std::atomic<u64> presented_frames{};
 inline std::atomic<const char*> stage{"waiting for guest display"};
 

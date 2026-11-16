@@ -54,6 +54,20 @@ public:
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
+#ifdef __OPENORBIS__
+    /// Keeps every emitted block but removes the direct block-to-block patches and the fast
+    /// dispatch table, so all transfers go through the dispatcher (and therefore through the
+    /// caller's block lookup) again. Used when a guest instruction-cache flush keeps the compiled
+    /// code and proves each block against guest memory as it is re-entered.
+    void PS4StripPatches();
+    /// Restores the direct jumps into a kept block after it has been proved unchanged.
+    void PS4Repatch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
+    /// Number of blocks currently registered (for the PS4 run log).
+    size_t PS4BlockCount() const {
+        return block_descriptors.size();
+    }
+#endif
+
 //protected:
     struct FastDispatchEntry {
         u64 location_descriptor = 0xFFFF'FFFF'FFFF'FFFFull;

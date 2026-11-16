@@ -63,6 +63,7 @@ extern "C" size_t ps4_heap_overflow_size();
 extern "C" int32_t sceKernelIsNeoMode();
 extern "C" uint64_t sceKernelGetCpuFrequency();
 extern "C" bool ps4_page_reuse;
+extern "C" bool ps4_block_reuse;
 extern "C" bool ps4_regalloc_free_moves;
 extern "C" bool ps4_regalloc_r13;
 extern "C" void ps4_sampler_start();
@@ -247,6 +248,9 @@ std::vector<Option> g_options = {
     {"page_reuse", "JIT page reuse",
      "Diagnostics: Off looks up the page table for every access.", "debug",
      {{"1", "On"}, {"0", "Off"}}},
+    {"block_reuse", "JIT block reuse",
+     "Off discards every translation on a guest instruction cache flush, as Dynarmic does.", "debug",
+     {{"1", "On"}, {"0", "Off"}}},
     {"regalloc", "JIT register tweaks",
      "Diagnostics: Off uses Dynarmic's original register allocation.", "debug",
      {{"on", "On"}, {"off", "Off"}}},
@@ -308,6 +312,7 @@ void ApplyOptions() {
     Common::PS4Diagnostics::inline_memory = enabled("inline_memory");
     Common::PS4Diagnostics::direct_table = enabled("direct_table");
     ps4_page_reuse = enabled("page_reuse");
+    ps4_block_reuse = enabled("block_reuse");
     ps4_regalloc_free_moves = ps4_regalloc_r13 = enabled("regalloc");
     Common::PS4Diagnostics::jit_cache_mb = static_cast<u32>(std::strtoul(OptionValue("jit_cache_mb"), nullptr, 10));
     auto& players = Settings::values.players.GetValue();
@@ -656,6 +661,13 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
             LOG_INFO(Frontend, "PS4 atomics: exclusive reads={}, writes={}, lost reservation={}",
                      exclusive_reads.exchange(0), exclusive_writes.exchange(0),
                      exclusive_failures.exchange(0));
+            // Kept blocks: how much translation each guest instruction-cache flush avoided, and how
+            // often the kept code turned out to be stale after all (which costs a recompile).
+            LOG_INFO(Frontend, "PS4 block reuse: flushes={}, blocks kept={}, proved={}, recompiled={}",
+                     Common::PS4Diagnostics::block_reuse_flushes.exchange(0),
+                     Common::PS4Diagnostics::block_reuse_kept.exchange(0),
+                     Common::PS4Diagnostics::block_reuse_proven.exchange(0),
+                     Common::PS4Diagnostics::block_reuse_recompiled.exchange(0));
             if (Common::PS4Diagnostics::profiler)
                 DrainProfiler(system);
             next_status = std::chrono::steady_clock::now() + std::chrono::seconds{10};

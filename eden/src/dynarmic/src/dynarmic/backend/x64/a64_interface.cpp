@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include <chrono>
 #include <boost/icl/interval_set.hpp>
@@ -36,6 +37,14 @@ extern "C" bool ps4_dump_block;
 namespace Dynarmic::A64 {
 
 using namespace Backend::X64;
+
+#ifdef __OPENORBIS__
+// ps4.ini "block_reuse=0" turns this off (read in yuzu_ps4/main.cpp).
+extern "C" bool ps4_block_reuse = true;
+// Reported by yuzu: kind 0 = flush (amount = blocks kept), 1 = block proved unchanged,
+// 2 = block recompiled because its guest code changed, 3 = block dropped for having no proof.
+extern "C" void ps4_count_block_reuse(int kind, unsigned long long amount);
+#endif
 
 static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*LookupBlock)(void* lookup_block_arg), void* arg, const A64::UserConfig& conf) {
     return RunCodeCallbacks{
@@ -248,13 +257,30 @@ private:
     }
 
     CodePtr GetBlock(IR::LocationDescriptor descriptor) {
-        if (auto block = emitter.GetBasicBlock(descriptor))
+        if (auto block = emitter.GetBasicBlock(descriptor)) {
+#ifdef __OPENORBIS__
+            // A flush no longer throws compiled code away; a block that predates the current epoch
+            // has to show that the guest words behind it are unchanged before it may run again.
+            if (PS4BlockStillValid(descriptor, block->entrypoint)) {
+                return block->entrypoint;
+            }
+            ps4_proofs.erase(descriptor);
+            emitter.InvalidateBasicBlocks({descriptor});
+            ps4_count_block_reuse(2, 0);
+#else
             return block->entrypoint;
+#endif
+        }
 
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
             invalidate_entire_cache = true;
+#ifdef __OPENORBIS__
+            // This one has to free the code cache for real: keeping the blocks here would leave no
+            // room to emit into. (A guest flush reaches this same handler without the flag.)
+            ps4_force_full_clear = true;
+#endif
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
@@ -270,6 +296,16 @@ private:
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
 #ifdef __OPENORBIS__
         const auto t1 = std::chrono::steady_clock::now();
+        // The guest words this block was built from, captured before the optimizer is allowed to
+        // touch the block's locations. A64 translation advances the PC by exactly 4 per
+        // instruction and never jumps, so [start, end) is the complete, contiguous code span.
+        const u64 proof_pc = arch_descriptor.PC();
+        const u64 proof_end_pc = A64::LocationDescriptor{ir_block.EndLocation()}.PC();
+        u32 proof_words = 0;
+        if (proof_end_pc > proof_pc && (proof_end_pc - proof_pc) % 4 == 0) {
+            const u64 count = (proof_end_pc - proof_pc) / 4;
+            proof_words = count <= 512 ? static_cast<u32>(count) : 0;
+        }
 #endif
         Optimization::Optimize(ir_block, conf, polyfill_options);
 #ifdef __OPENORBIS__
@@ -281,6 +317,9 @@ private:
 #ifdef DYNARMIC_PAGE_REUSE_TEST
         {
             const auto desc = emitter.Emit(ir_block);
+#ifdef __OPENORBIS__
+            PS4RecordProof(descriptor, proof_pc, proof_words);
+#endif
             static const bool dump_all = std::getenv("PS4_DUMP_ALL") != nullptr;
             static int dump_index = 0;
             if (dump_all) {
@@ -302,9 +341,86 @@ private:
             return desc.entrypoint;
         }
 #else
-        return emitter.Emit(ir_block).entrypoint;
+        const auto desc = emitter.Emit(ir_block);
+#ifdef __OPENORBIS__
+        PS4RecordProof(descriptor, proof_pc, proof_words);
+#endif
+        return desc.entrypoint;
 #endif
     }
+
+#ifdef __OPENORBIS__
+    // -----------------------------------------------------------------------------------
+    // Kept blocks across a guest instruction-cache flush.
+    //
+    // A full IC IALLU used to discard every translation, so the guest paid to compile exactly the
+    // same code again (Run L: 157k blocks thrown away at the first one, ~70 us each). A block is
+    // now kept, stamped with the flush epoch it was compiled in, and on the first entry after a
+    // flush it has to prove that the guest instruction words behind it are unchanged: two
+    // independent 64-bit hashes over the same contiguous word range that was translated. A block
+    // that fails the proof is unpatched and recompiled, which is what happened to every block
+    // before. So this changes how much we compile and never what the guest computes.
+    struct PS4BlockProof {
+        u64 hash_a = 0;
+        u64 hash_b = 0;
+        u64 pc = 0;
+        u32 words = 0;
+        u32 epoch = 0;
+    };
+    // Roughly one entry per distinct block; the cap keeps a pathological guest from growing the
+    // table without bound (past it, flushes fall back to discarding the cache as before).
+    static constexpr size_t PS4_MAX_PROOFS = 400'000;
+
+    void PS4HashSpan(u64 pc, u32 words, u64& a, u64& b) const {
+        a = 0xcbf29ce484222325ull;
+        b = 0x9e3779b97f4a7c15ull;
+        for (u32 i = 0; i < words; ++i) {
+            const u64 word = conf.callbacks->MemoryReadCode(pc + 4ull * i).value_or(0);
+            a = (a ^ word) * 0x100000001b3ull;
+            a ^= a >> 32;
+            b = (b + word + 0x9e3779b97f4a7c15ull) * 0xff51afd7ed558ccdull;
+            b ^= b >> 29;
+        }
+    }
+
+    void PS4RecordProof(IR::LocationDescriptor descriptor, u64 pc, u32 words) {
+        if (words == 0) {
+            // Not a contiguous, size-bounded span: never reuse this block.
+            ps4_proofs.erase(descriptor);
+            return;
+        }
+        PS4BlockProof proof;
+        proof.pc = pc;
+        proof.words = words;
+        proof.epoch = ps4_epoch;
+        PS4HashSpan(pc, words, proof.hash_a, proof.hash_b);
+        ps4_proofs.insert_or_assign(descriptor, proof);
+    }
+
+    bool PS4BlockStillValid(const IR::LocationDescriptor& descriptor, CodePtr entrypoint) {
+        const auto it = ps4_proofs.find(descriptor);
+        if (it == ps4_proofs.end()) {
+            ps4_count_block_reuse(3, 0);
+            return false;
+        }
+        PS4BlockProof& proof = it->second;
+        if (proof.epoch == ps4_epoch) {
+            return true;  // compiled since the last flush: nothing to prove
+        }
+        u64 a = 0;
+        u64 b = 0;
+        PS4HashSpan(proof.pc, proof.words, a, b);
+        if (a != proof.hash_a || b != proof.hash_b) {
+            return false;
+        }
+        proof.epoch = ps4_epoch;
+        // Same guest code, so the direct jumps into this block that the flush took out (they bypass
+        // this check, which is why they had to go) can be put back.
+        emitter.PS4Repatch(descriptor, entrypoint);
+        ps4_count_block_reuse(1, 0);
+        return true;
+    }
+#endif
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
         if (Has(hr, HaltReason::CacheInvalidation)) {
@@ -318,8 +434,27 @@ private:
 
             jit_state.ResetRSB();
             if (invalidate_entire_cache) {
+#ifdef __OPENORBIS__
+                // Keep the compiled code: only the ways of reaching it without a lookup are cut
+                // (direct block-to-block patches, fast dispatch, the return stack above), so every
+                // block is proved against guest memory before it runs again. Anything unprovable
+                // falls back to the old behaviour of discarding everything.
+                if (ps4_block_reuse && !ps4_force_full_clear &&
+                    ps4_proofs.size() <= PS4_MAX_PROOFS) {
+                    ++ps4_epoch;
+                    ps4_count_block_reuse(0, emitter.PS4BlockCount());
+                    emitter.PS4StripPatches();
+                } else {
+                    block_of_code.ClearCache();
+                    emitter.ClearCache();
+                    ps4_proofs.clear();
+                    ++ps4_epoch;
+                }
+                ps4_force_full_clear = false;
+#else
                 block_of_code.ClearCache();
                 emitter.ClearCache();
+#endif
             } else {
                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
             }
@@ -336,6 +471,11 @@ private:
     Optimization::PolyfillOptions polyfill_options;
     bool is_executing = false;
     bool invalidate_entire_cache = false;
+#ifdef __OPENORBIS__
+    std::unordered_map<IR::LocationDescriptor, PS4BlockProof> ps4_proofs;
+    u32 ps4_epoch = 1;
+    bool ps4_force_full_clear = false;
+#endif
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;
 };

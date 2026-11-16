@@ -28,6 +28,24 @@ extern "C" void ps4_count_exclusive(int kind) {
     default: Common::PS4Diagnostics::exclusive_failures.fetch_add(1, std::memory_order_relaxed); break;
     }
 }
+
+// Kept-block cache across a guest instruction-cache flush (declared in a64_interface.cpp):
+// kind 0 = flush, amount = blocks kept; 1 = block proved unchanged; 2 = block recompiled because its
+// guest code changed; 3 = block had no proof and was dropped.
+extern "C" void ps4_count_block_reuse(int kind, unsigned long long amount) {
+    switch (kind) {
+    case 0:
+        Common::PS4Diagnostics::block_reuse_flushes.fetch_add(1, std::memory_order_relaxed);
+        Common::PS4Diagnostics::block_reuse_kept.fetch_add(amount, std::memory_order_relaxed);
+        break;
+    case 1:
+        Common::PS4Diagnostics::block_reuse_proven.fetch_add(1, std::memory_order_relaxed);
+        break;
+    default:
+        Common::PS4Diagnostics::block_reuse_recompiled.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+}
 #endif
 
 namespace Core {

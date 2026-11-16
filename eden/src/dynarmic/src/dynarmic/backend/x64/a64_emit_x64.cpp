@@ -199,6 +199,43 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
     InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
 }
 
+#ifdef __OPENORBIS__
+void A64EmitX64::PS4StripPatches() {
+    // A patched terminal is a direct jmp/mov-rcx into another block's entrypoint, and a fast
+    // dispatch entry is a code pointer keyed by location descriptor; both bypass the block lookup,
+    // which is exactly where a kept block is proved against guest memory. Rewriting every patch
+    // site back to its dispatcher form (which is what Unpatch does) leaves the block's own code
+    // intact, so the work is proportional to the number of patched sites, not to the code size.
+    // The site lists themselves are kept: they are the only record of which emitted block jumps to
+    // which location, so PS4Repatch can put the direct jumps back once a kept block has been proved
+    // unchanged, and a block compiled after the flush re-patches its own sites through Patch().
+    ::Common::unordered_set<IR::LocationDescriptor> patched;
+    patched.reserve(patch_information.size());
+    for (const auto& [descriptor, patch_info] : patch_information) {
+        static_cast<void>(patch_info);
+        patched.insert(descriptor);
+    }
+    code.EnableWriting();
+    for (const auto& descriptor : patched) {
+        Unpatch(descriptor);
+    }
+    code.DisableWriting();
+    ClearFastDispatchTable();
+}
+
+void A64EmitX64::PS4Repatch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    // Only the sites that were recorded for this target, and only if any exist: this runs once per
+    // kept block per flush, on the path that has just proved the block's guest code unchanged.
+    const auto it = patch_information.find(target_desc);
+    if (it == patch_information.end()) {
+        return;
+    }
+    code.EnableWriting();
+    Patch(target_desc, target_code_ptr);
+    code.DisableWriting();
+}
+#endif
+
 void A64EmitX64::ClearFastDispatchTable() {
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         fast_dispatch_table.fill({});

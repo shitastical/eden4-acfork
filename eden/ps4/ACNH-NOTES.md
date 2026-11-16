@@ -1036,3 +1036,94 @@ cannot be hashed exactly (a non-contiguous block) falls back to today's behaviou
 That is a change to the JIT's invalidation core, and it needs dynarmic's own
 self-modifying-code tests run on the host before it goes anywhere near the console, so
 it is deliberately not folded into this measured run.
+
+## Run N — keep the compiled blocks, prove them instead of trusting them
+
+Run M's instrumentation exists to answer one question, and the load-phase numbers already
+answer it well enough to act: the collapse is translation, and the same guest code is
+translated two or three times per session because a full `IC IALLU` throws the whole cache
+away. Run K established those flushes are not a capacity event. So the code is being
+compiled again for no reason other than that we cannot prove it did not change.
+
+This run changes that: a flush keeps every compiled block, and each block is **proved
+against guest memory** the first time it is entered after the flush.
+
+### Why a proof is possible at all
+
+A64 translation advances the guest PC by exactly four bytes per instruction and never
+jumps (`a64_translate.cpp`: one `AdvancePC(4)` per iteration, no other assignment before
+the optimiser runs). So a block's source is always the contiguous word range
+`[Location().PC(), EndLocation().PC())`, and the instruction count is
+`(end - start) / 4`. Two independent 64-bit hashes over those words, taken from
+`MemoryReadCode` at compile time, are all we need: re-reading the same range and getting the
+same two hashes means every instruction in the block is byte-identical to what was
+translated, and matching on both is a 2⁻¹²⁸ event if it is not.
+
+The direction of failure is what makes this safe to ship: a proof can only be too strict.
+A block that is not a contiguous, size-bounded span gets no proof and is never reused; a
+block whose words changed fails the proof and is thrown away; a block that cannot read its
+words fails too. The only way this executes code the guest did not ask for is a double
+64-bit hash collision inside one block, which is not a thing that happens.
+
+### The part that actually needed care: how blocks reach each other
+
+Proving a block at lookup time is useless if anything can jump into it without a lookup.
+dynarmic has three such paths, and all three bypass `GetBlock` by design:
+
+1. **Direct block-to-block patches** — `Patch()` rewrites a terminal in an already-emitted
+   block into a `jmp` straight to the target's entrypoint.
+2. **The fast dispatch table** — a 1M-entry table of `{location_descriptor, code_ptr}`
+   that the terminal handler hits without a map lookup.
+3. **The return stack buffer** — recorded code pointers used on `ret`.
+
+A flush now (a) removes the RSB (`ResetRSB`, as before), (b) empties the fast dispatch
+table, and (c) rewrites every patched site back to its dispatcher form. Only then does the
+epoch advance, so from that instant every transfer goes through the lookup and therefore
+through the proof. The site lists in `patch_information` are **kept**, because they record
+which emitted block jumps to which location: when a kept block passes its proof,
+`PS4Repatch` puts its inbound direct jumps back, and a block compiled after the flush
+re-patches its own sites through the normal `Patch()` path. The direct-jump network is
+therefore rebuilt lazily, only for code that proves itself, instead of being lost.
+
+The strip is `Unpatch`, which is the same primitive dynarmic already uses when a data
+write invalidates a range — the change is only *when* it runs and that the code survives.
+
+### Two fallbacks, on purpose
+
+- **Arena exhaustion** (`SpaceRemaining() < 1 MiB`) reaches the same handler as a guest
+  flush, and must free memory or the emitter would write past the cache. It sets
+  `ps4_force_full_clear`, and the flush then discards everything exactly as before. The
+  guest-flush path can never take that branch.
+- **Proof table cap** (`400k` entries). Past it, flushes go back to discarding the cache,
+  so a pathological guest cannot grow the table without bound. The table costs ~70 bytes
+  per kept block (~28 MB at the cap), which is the price of the feature.
+
+Both fallbacks keep today's behaviour, and `ps4.ini`'s `block_reuse=0` turns the whole
+thing off (`JIT block reuse`, System Settings → debug), in which case the build is
+byte-for-byte the old flush behaviour.
+
+### What the log says
+
+A new 10 s line, next to the atomics one:
+
+```
+PS4 block reuse: flushes=N, blocks kept=M, proved=P, recompiled=R
+```
+
+- `flushes` — guest instruction-cache flushes that kept their code.
+- `blocks kept` — blocks that would have been thrown away (this is the work saved).
+- `proved` — blocks that passed the hash and ran again without recompiling.
+- `recompiled` — blocks that failed the proof. On the loader this should be small but not
+  zero: the guest really does write new code and then flush, and those blocks must be
+  rebuilt. If `recompiled` is a large fraction of `kept`, the guest is writing far more
+  code than we think and the idea needs revisiting.
+
+Expect the first `blocks kept` to be the big one (the loader burst Run L saw discarding
+157k blocks), and the fps windows that follow a flush to stop collapsing to 10–16.
+
+### Honest accounting
+
+This removes re-translation after flushes. It does not make the emitter faster, and it does
+not make a guest memory access cheaper — those are still the two costs of the 30 fps
+plateau. What it should do is compress the *load* phases, which is where the run-average
+fps loses most of its ground against the 29–30 fps plateau.
