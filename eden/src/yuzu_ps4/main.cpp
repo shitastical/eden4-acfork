@@ -652,6 +652,33 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
                      perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
                      static_cast<double>(wait_us) / 1000.0 * per_frame,
                      static_cast<double>(idle_us) / 1000.0 * per_frame, frames);
+            // Guest blocking time in svcWaitSynchronization for the same window, by object class.
+            // A frame that runs out of CPU has to be executing guest code; one whose threads park
+            // here is waiting on each other or on a GPU fence instead.
+            {
+                const u64 blocked_us = Common::PS4Diagnostics::guest_wait_us.exchange(0);
+                const u64 blocked_calls = Common::PS4Diagnostics::guest_wait_count.exchange(0);
+                if (blocked_calls != 0) {
+                    LOG_INFO(Frontend,
+                             "PS4 guest waits: {} waits, {:.1f} ms/frame blocked in "
+                             "svcWaitSynchronization",
+                             blocked_calls,
+                             static_cast<double>(blocked_us) / 1000.0 * per_frame);
+                    for (int i = 0; i < Common::PS4Diagnostics::kGuestWaitSlots; i++) {
+                        auto& slot = Common::PS4Diagnostics::guest_waits[i];
+                        if (!slot.name)
+                            continue;
+                        LOG_INFO(Frontend,
+                                 "PS4 guest waits:   {} {} calls, {:.1f} ms total, {:.1f} ms longest",
+                                 slot.name, slot.count, static_cast<double>(slot.us) / 1000.0,
+                                 static_cast<double>(slot.max_us) / 1000.0);
+                        slot.name = nullptr;
+                        slot.us = 0;
+                        slot.count = 0;
+                        slot.max_us = 0;
+                    }
+                }
+            }
             // Guest atomics for the same window. Each one is a host call into the exclusive monitor
             // plus a guest memory access, and the whole path is shared by the three cores, so the
             // rate here says how much of a slow frame could be this.

@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef __OPENORBIS__
+#include <chrono>
+#include "common/ps4_diagnostics.h"
+#endif
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
@@ -94,8 +98,22 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
         timeout = timeout_ns;
     }
 
+#ifdef __OPENORBIS__
+    // This parks the calling host thread until the guest's wait is satisfied, so the elapsed time
+    // here is exactly the guest's own blocking time (see PS4Diagnostics::NoteGuestWait).
+    const auto ps4_wait_start = std::chrono::steady_clock::now();
+#endif
     // Wait on the objects.
     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
+#ifdef __OPENORBIS__
+    {
+        const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - ps4_wait_start)
+                                            .count());
+        Common::PS4Diagnostics::NoteGuestWait(
+            us, num_handles > 0 && objs[0] != nullptr ? objs[0]->GetTypeName() : "none");
+    }
+#endif
 
     R_SUCCEED_IF(res == ResultSessionClosed);
     R_RETURN(res);

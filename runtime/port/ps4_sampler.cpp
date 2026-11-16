@@ -101,7 +101,12 @@ struct JitBlock {
     uint64_t host;
     uint64_t info;  // guest pc (48 bits) | min(code size, 0xFFFF) << 48
 };
-constexpr uint32_t kMaxBlocks = 262144;
+// One registration per compiled block, shared by every core and only reset by a cache clear. ACNH
+// compiles ~208k blocks per cache generation on CPUCore_0 and 55-105k on the others, so 262144
+// entries were exhausted inside the first generation: the cores that registered late (1 and 2) had
+// no entries at all and every one of their samples showed up as unattributed "jit-glue". 1048576
+// entries (16 MiB, calloc'd and untouched below the high-water mark) hold a full generation.
+constexpr uint32_t kMaxBlocks = 1048576;
 std::atomic<JitBlock*> g_blocks{nullptr};
 std::atomic<uint32_t> g_block_count{0};
 uint32_t g_block_order[kMaxBlocks];  // indices sorted by host address (sampler thread only)

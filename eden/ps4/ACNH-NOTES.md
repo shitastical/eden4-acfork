@@ -1134,3 +1134,90 @@ This removes re-translation after flushes. It does not make the emitter faster, 
 not make a guest memory access cheaper — those are still the two costs of the 30 fps
 plateau. What it should do is compress the *load* phases, which is where the run-average
 fps loses most of its ground against the 29–30 fps plateau.
+
+## Run O — the first measurements of a real M+N run, and two corrected beliefs
+
+Runs M and N were built and shipped, then the console's own logs were pulled
+(`/data/ACNH/logs/eden.log`, `eden.previous.log`, `frames.log`) and read. Two things
+that earlier runs believed turned out to be wrong, and both are worth stating plainly.
+
+### Run N never fires, and that is not a bug in Run N
+
+Every 10 s window of a 4 minute run prints
+
+```
+PS4 block reuse: flushes=0, blocks kept=0, proved=0, recompiled=0
+```
+
+so no guest instruction-cache flush happened at all during play. There is not a single
+`IC IALLU` line in the session. Run K concluded that the cache clears were the guest
+flushing its own code; this run shows the opposite — the two clears that do happen are
+**capacity** clears, produced by the emulated arena filling up:
+
+```
+cache clear 1 ... (during boot, t~9 s)
+cache clear 2 with 207900 blocks live (t=35 s)
+cache clear 3 with 382813 blocks live (t=173 s)
+```
+
+(`blocks live` is mislabelled: it prints the cumulative number of translated blocks, not
+the number resident.) ACNH touches so much code that 96 MiB holds roughly 175–208k
+blocks, and a 3 minute session compiles ~430k. Each clear costs ~12 s of re-emission on
+the very thread that runs the game, and the frames right after one collapse: 301 frames
+per 10 s (the 30 fps cap) before, 131 right after the t=173 s clear, ~230 (23 fps) a
+minute later.
+
+So Run N is inert on this title: it targets an event that does not occur in play. It is
+kept (it costs nothing when no flush happens) but it is not the answer to anything here.
+The memory wall behind the capacity clears is real: the guest reserves 4 GiB of the
+console's 4.5 GiB, leaving ~600 MiB of direct memory for the JIT, the texture cache and
+the host heap together. Four 96 MiB caches (384 MiB) already failed with `ENOMEM`
+(0x8002000c), which is why the sizes are 96/64/64. **The code cache cannot simply be
+made bigger** — that is a hard limit of this design, not a setting.
+
+### `jit-glue` on cores 1 and 2 was a profiler artifact
+
+The sampler keeps one registration per compiled block, in a fixed table of 262144
+entries shared by all cores. The table is only reset by a cache clear, and core 0 alone
+registers ~208k blocks per generation, so it was exhausted inside the first generation:
+`CPUCore_1` and `CPUCore_2` registered almost nothing afterwards and *every* sample of
+their translated code was reported as unattributed `jit-glue` (45–61% of those cores).
+The table is now 1048576 entries (16 MiB, `calloc`, untouched below the high-water
+mark), which holds a full generation, so the next run's per-core profile is real.
+
+With that caveat, the gameplay profile (t=231 s, core 0) is:
+
+```
+guest-jit 63.5%, jit-glue 3.5%, eboot 9.7%, system 23.1%
+```
+
+Host code is 9.7% and completely flat (top address 1.2%), so the emulator's own C++ is
+not the cost. Guest PCs are flat too (top 0.9%). The interesting number is the 23.1% of
+"system": it is **one address**, `0x800003710`, 22.4% of the core, and the completely
+idle `CPUCore_3` sits 100% in the same address. That is our wait primitive, i.e. the
+guest thread parked — core 0 is not CPU-starved for that quarter, it is blocked.
+
+### Run O (this build): find out what a frame blocks on
+
+Nothing in a frame can be fixed before it is known whether the guest spends those ~10 ms
+per frame waiting for another guest thread (CPU bound, a scheduling problem) or for the
+GPU to finish (renderer bound, a completely different fix). So this build measures it at
+the one choke point where an emulated thread can park, `KSynchronizationObject::Wait`
+behind `svcWaitSynchronization`:
+
+```
+PS4 guest waits: N waits, X ms/frame blocked in svcWaitSynchronization
+PS4 guest waits:   <class> C calls, T ms total, L ms longest
+```
+
+The classes come from `KSynchronizationObject::GetTypeName()` (`KEvent`, `KSemaphore`,
+`KReadableEvent`, `KThread`, ...), so the log names the object instead of guessing. Only
+waits over 2 ms claim a slot, so the table stays a list of the waits that can move a
+frame, and the call itself is unchanged — the timer wraps the existing blocking call.
+
+Together with the corrected block map, the next run answers the last open question:
+
+- a fence/event class dominating ⇒ the renderer is the limiter and the CPU has slack,
+- `KThread` dominating ⇒ core 0 waits for the guest's worker threads,
+- neither (waits stay small) ⇒ the frame really is ~43 ms of guest execution, and the
+  remaining gap to 33.3 ms is translation speed, which no setting can buy back.

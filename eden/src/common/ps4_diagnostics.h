@@ -2,8 +2,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 #include <sys/types.h>
 #include "common/common_types.h"
@@ -65,6 +67,59 @@ inline std::atomic<u64> block_reuse_proven{};
 inline std::atomic<u64> block_reuse_recompiled{};
 inline std::atomic<u64> presented_frames{};
 inline std::atomic<const char*> stage{"waiting for guest display"};
+// Guest blocking time inside svcWaitSynchronization (svc_synchronization.cpp): the one place an
+// emulated thread parks. A frame that is CPU bound has to *run*; a frame whose threads wait on each
+// other or on a GPU fence spends its wall time here. The slots keep the longest waits by object
+// class (KSynchronizationObject::GetTypeName), so the next log says what a slow frame waits for.
+constexpr int kGuestWaitSlots = 6;
+struct GuestWaitSlot {
+    const char* name{};
+    u64 us{};
+    u64 count{};
+    u64 max_us{};
+};
+inline std::atomic<u64> guest_wait_us{};
+inline std::atomic<u64> guest_wait_count{};
+inline GuestWaitSlot guest_waits[kGuestWaitSlots]{};
+inline std::atomic_flag guest_wait_lock = ATOMIC_FLAG_INIT;
+inline void NoteGuestWait(u64 us, const char* name) {
+    guest_wait_us.fetch_add(us, std::memory_order_relaxed);
+    guest_wait_count.fetch_add(1, std::memory_order_relaxed);
+    if (us < 2000) {
+        return;  // only waits that can move a frame are worth a slot
+    }
+    while (guest_wait_lock.test_and_set(std::memory_order_acquire)) {
+    }
+    GuestWaitSlot* free_slot = nullptr;
+    for (int i = 0; i < kGuestWaitSlots; i++) {
+        GuestWaitSlot& slot = guest_waits[i];
+        if (slot.name == name || (slot.name && name && std::strcmp(slot.name, name) == 0)) {
+            slot.us += us;
+            slot.count++;
+            slot.max_us = std::max(slot.max_us, us);
+            free_slot = nullptr;
+            guest_wait_lock.clear(std::memory_order_release);
+            return;
+        }
+        if (!slot.name && !free_slot) {
+            free_slot = &slot;
+        }
+    }
+    // No slot for this class yet: take a free one, otherwise the shortest total (it is a histogram).
+    if (!free_slot) {
+        free_slot = &guest_waits[0];
+        for (int i = 1; i < kGuestWaitSlots; i++) {
+            if (guest_waits[i].us < free_slot->us) {
+                free_slot = &guest_waits[i];
+            }
+        }
+    }
+    free_slot->name = name;
+    free_slot->us = us;
+    free_slot->count = 1;
+    free_slot->max_us = us;
+    guest_wait_lock.clear(std::memory_order_release);
+}
 
 inline void Reset() {
     composites = 0;
