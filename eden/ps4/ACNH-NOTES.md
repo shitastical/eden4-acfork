@@ -836,3 +836,92 @@ What is worth taking from it is its *method* — sample, name the hot guest func
 then attack that one thing — and the numbers above say where to attack first: 19.8% of
 the critical core is spent compiling guest code, and we cannot even name the guest
 functions yet. The next run will, with the range fixed.
+
+## Run L — the profile names the guest, and the answer is "no hot function"
+
+First run with working guest-PC attribution (the range fix in `ps4_sampler.cpp`). 22
+heartbeat windows over 228 s, and the sampler now reports `guest-jit` and a `guest`
+address list per thread:
+
+| Window | fps |
+|---|---|
+| 0 s | 2.0 (boot) |
+| 10–20 s | 15.9 |
+| 20–100 s | 28.9, 29.3, 25.7, 26.4, **30.0**, 29.0, 28.9, 27.2 |
+| 110–228 s | 18.4, 15.6, 15.8, 16.1, 15.2, 10.6, 10.3 |
+
+Free roaming still tops out at 30.0 and two windows now sit **on** the cap, so the
+remaining work is the collapse after ~110 s, not the plateau.
+
+### Shares of wall time (not of busy time)
+
+| Thread | guest-jit | jit-glue | our C++ | system |
+|---|---|---|---|---|
+| CPUCore_0 | **47.2%** | 5.1% | 22.5% | 23.3% |
+| CPUCore_1 | 18.2% | 17.5% | 12.2% | 50.3% |
+| CPUCore_2 | 11.4% | 17.4% | 8.9% | 60.5% |
+| CPUCore_3 | 0.0% | 0.0% | 0.2% | 99.8% |
+| HostTiming | 0.0% | 0.0% | 27.6% | 72.4% |
+| VulkanWorker | 0.0% | 0.0% | 2.9% | 97.1% |
+
+The sampler fires per thread regardless of state, so these are fractions of the 228 s,
+which is the number worth having: on the critical core, 47% is the guest's own
+instructions, 22.5% is our code, 23.3% is host waits.
+
+### What the guest is actually doing
+
+336 distinct guest PCs were sampled on core 0, and the top twelve are only 58 points
+of the run between them — **inside any single window the hottest guest PC is 2–8%**.
+Disassembled from the `PROFILE code` dumps (Capstone):
+
+| pc | share | what it is |
+|---|---|---|
+| `0x823939a4` | 9.4% | byte-wise `memcpy` tail (`ldrb`/`strb`/`cbnz`) |
+| `0x84bc98bc` | 8.3% | AES-128 decrypt, ten `aese`/`aesmc` per 16 B |
+| `0x850ad904` | 7.4% | `memset`, 32 B per `stp` |
+| `0x823d2b58` | 7.3% | word-wise copy loop (`ldr`/`str`/`b.ne`) |
+| `0x82bf2400` | 5.3% | virtual dispatch (load vtable, `blr`) |
+| `0x85093920` | 4.6% | `strcmp` (`ldrb` pair + `ccmp`) |
+| `0x82bf2400`… | | and 330 more, each under 4% |
+
+So **29% of the critical thread is the guest's own hand-written memory loops** and there
+is no single hot function to accelerate — the game loads, compares and clears buffers
+with the code its compiler emitted into the executable. These are not "hard to emulate"
+constructs; each iteration is one load and one store.
+
+That is why they cost so much here: `fastmem_arena` is never assigned on this port, so
+`config.fastmem_pointer` is empty and every guest load or store runs dynarmic's *inline
+two-level page-table walk* — two dependent loads plus the address arithmetic before the
+actual access. Fine once per real access, expensive once per byte copied. A recompiled
+build would not change this; a cheaper access path would.
+
+### Our own 22.5% is the emitter
+
+Symbolized: `Xbyak::CodeArray::db(int)`, `Xbyak::CodeGenerator::opRO_MR`,
+`boost::container::stable_vector_iterator<Xbyak::Label*>` (the per-branch label list),
+`Dynarmic::SpinLock::Unlock`, `Dynarmic::IR::Value::IsImmediate`, and `memset`. This is
+the cost of compiling guest code, and it is the largest block of our own time by far.
+
+### The collapse is not compute
+
+The 171 s window has `system 53.9%`, `our C++ 38.3%`, `guest-jit 1.8%`, and its hottest
+guest PC is 0.15%: the guest is waiting, not working. 10 fps with an idle core is
+streaming and syscalls, which also puts the 8.3% AES loop where you would expect an
+on-the-fly content decrypt. That is a different fix from everything above and it is the
+reason the run mean (22.4 fps by frame log) disagrees with the plateau (28–30).
+
+### Answer to "should we graft recompiled code in?"
+
+No, and the profile now says why in one line: the guest's time is **diffuse**. There is
+no function worth 20% of a frame to replace; the top one is 8.5% in its best window and
+the cost is spread over 336 PCs, of which the biggest group is generic buffer-copy code
+that a recompilation would compile just as 1:1 as we translate it. A graft would buy
+very little and cost a bespoke ABI bridge per function plus invalidation rules we cannot
+control. The levers the numbers do support, in order:
+
+1. **Make a guest memory access cheaper than two dependent loads.** That is 29% of the
+   critical thread, it is where emulation overhead multiplies by byte count, and it is
+   the only change with a plausible 10–20% on the plateau.
+2. **Compile less per guest instruction** — emit is 22.5% of the critical thread; the
+   hot addresses are inside Xbyak and dynarmic's label bookkeeping.
+3. **Stream better** — fixes the collapse, not the plateau.
