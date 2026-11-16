@@ -70,6 +70,11 @@ constexpr size_t PRELUDE_COMMIT_SIZE = 16 * 1024 * 1024;
 #ifndef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #error "PS4 requires checked writable/executable JIT protection transitions"
 #endif
+// Set when the kernel hands out code pages that are writable and executable at once, so nothing has to
+// be reprotected while compiling. Cleared if any allocation is refused, which puts every buffer back on
+// the RW/RX window path (that path only ever narrows permissions, so it stays correct for an RWX buffer).
+bool g_ps4_code_rwx = true;
+
 class PS4CodeAllocator final : public Xbyak::Allocator {
 public:
     uint8_t* alloc(size_t size) override {
@@ -77,8 +82,21 @@ public:
         if (size > SIZE_MAX - 2 * page) return nullptr;
         const size_t length = ((size + page - 1) & ~(page - 1)) + page;
         void* base = nullptr;
-        const int result = sceKernelMapNamedFlexibleMemory(&base, length,
-            PROT_READ | PROT_WRITE, 0, "Eden JIT");
+        // Blocks are written while the guest runs, so the cache is asked for as RWX: without that every
+        // compiled block costs two sceKernelMprotect calls (16.5 us and a TLB shootdown to the other
+        // cores: 7.1 s of a 3.4 minute run on core 0). See PS4EnsureWritable.
+        int result = sceKernelMapNamedFlexibleMemory(&base, length,
+            PROT_READ | PROT_WRITE | PROT_EXEC, 0, "Eden JIT");
+        const bool rwx = result == 0;
+        if (!rwx) {
+            const int rwx_error = result;
+            base = nullptr;
+            result = sceKernelMapNamedFlexibleMemory(&base, length,
+                PROT_READ | PROT_WRITE, 0, "Eden JIT");
+            g_ps4_code_rwx = false;
+            LOG_INFO(Core, "PS4 JIT: RWX code memory refused ({:#x}), using RW/RX windows",
+                     static_cast<u32>(rwx_error));
+        }
         if (result != 0) {
             LOG_ERROR(Core, "PS4 JIT allocation of {} KiB failed: {:#x}",
                       length / 1024, static_cast<u32>(result));
@@ -86,7 +104,8 @@ public:
         }
         // Keep the allocation size in a separate RW page. Code pages become RX.
         *static_cast<size_t*>(base) = length;
-        LOG_INFO(Core, "PS4 JIT: {} KiB in regular flexible memory at {}", length / 1024, base);
+        LOG_INFO(Core, "PS4 JIT: {} KiB in regular flexible memory at {} ({})", length / 1024, base,
+                 rwx ? "RWX" : "RW, RX windows");
         return static_cast<uint8_t*>(base) + page;
     }
     void free(uint8_t* pointer) override {
@@ -250,6 +269,8 @@ void BlockOfCode::EnableWriting() {
 #ifdef __OPENORBIS__
     ps4_writing = true;
     ps4_window_start_ns = NowNs();
+    if (g_ps4_code_rwx)
+        return;  // already writable and executable: nothing to change per block
     PS4EnsureWritable(getCurr(), PS4_WRITE_WINDOW, PS4_WRITE_EXTEND);
 #elif defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
 #    ifdef _WIN32
@@ -267,7 +288,8 @@ void BlockOfCode::DisableWriting() {
         ps4_windows++;
     }
     ps4_writing = false;
-    PS4RestoreExecutable();
+    if (!g_ps4_code_rwx)
+        PS4RestoreExecutable();
     if (ps4_windows != 0 && ps4_windows % 5000 == 0)
         PS4LogStats();
 #elif defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
@@ -281,16 +303,20 @@ void BlockOfCode::DisableWriting() {
 
 #ifdef __OPENORBIS__
 void BlockOfCode::PS4InitProtection() {
+    ps4_first_ns = NowNs();
+    if (g_ps4_code_rwx)
+        return;  // code pages stay writable and executable: no page map to track
     ps4_base = reinterpret_cast<uintptr_t>(getCode()) & ~(PS4_PAGE - 1);
     const uintptr_t end = reinterpret_cast<uintptr_t>(getCode()) + maxSize_;
     ps4_writable.assign(PS4Page(end - 1) + 1, 1);
     // The constant pool is data written while compiling; keep its pages RW and put the code after it.
     align(PS4_PAGE);
     ps4_data_pages = PS4Page(reinterpret_cast<uintptr_t>(getCurr()));
-    ps4_first_ns = NowNs();
 }
 
 void BlockOfCode::PS4Protect(size_t first_page, size_t page_count, bool writable) {
+    if (g_ps4_code_rwx)
+        return;
     const uint64_t start = NowNs();
     const uintptr_t address = ps4_base + first_page * PS4_PAGE;
     const size_t length = page_count * PS4_PAGE;
@@ -306,6 +332,8 @@ void BlockOfCode::PS4Protect(size_t first_page, size_t page_count, bool writable
 }
 
 void BlockOfCode::PS4EnsureWritable(const void* begin, size_t length, size_t extend_to) {
+    if (g_ps4_code_rwx)
+        return;  // no page map to consult: everything is already writable
     const uintptr_t end = reinterpret_cast<uintptr_t>(getCode()) + maxSize_;
     const uintptr_t low = reinterpret_cast<uintptr_t>(begin);
     if (low >= end)
@@ -333,6 +361,8 @@ void BlockOfCode::PS4EnsureWritable(const void* begin, size_t length, size_t ext
 }
 
 void BlockOfCode::PS4RestoreExecutable() {
+    if (g_ps4_code_rwx)
+        return;
     if (!ps4_sealed) {
         // First call, after the prelude: everything but the constant pool becomes RX at once.
         ps4_sealed = true;
@@ -365,11 +395,11 @@ void BlockOfCode::PS4RestoreExecutable() {
 void BlockOfCode::PS4LogStats() {
     const double wall_ms = static_cast<double>(NowNs() - ps4_first_ns) / 1e6;
     LOG_INFO(Core,
-             "PS4 JIT {}: {} blocks, translate {:.0f} ms, optimize {:.0f} ms, emit {:.0f} ms (mprotect {:.0f} ms), "
-             "{} cache clears, {:.0f} ms since cache start",
+             "PS4 JIT {}: {} blocks, translate {:.0f} ms, optimize {:.0f} ms, emit {:.0f} ms (mprotect {:.0f} ms, "
+             "{} calls), {} cache clears, {:.0f} ms since cache start",
              static_cast<const void*>(getCode()), ps4_windows, static_cast<double>(ps4_translate_ns) / 1e6,
              static_cast<double>(ps4_optimize_ns) / 1e6, static_cast<double>(ps4_window_ns) / 1e6,
-             static_cast<double>(ps4_protect_ns) / 1e6, ps4_clears, wall_ms);
+             static_cast<double>(ps4_protect_ns) / 1e6, ps4_protect_calls, ps4_clears, wall_ms);
 }
 #endif
 

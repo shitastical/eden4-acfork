@@ -653,8 +653,84 @@ What is genuinely useful from it is its *findings*, all of which are cheap here:
   those pipelines on a background thread so a new area does not compile mid-frame;
 - it added an option to **bypass the CPU-heavy audio reverb**, which is directly
   applicable: audio is emulated on the same weak cores;
-- it accelerates **game data decryption with AES-NI**; the PS4's Jaguar supports AES
-  instructions, and this port decrypts game data in software, so the same trick would
-  cut load times (not frame time).
+- it accelerates **game data decryption with AES-NI**: already true here, so there is
+  nothing to borrow. `dynarmic/backend/x64/emit_x64_aes.cpp` emits `aesenclast`,
+  `aesdeclast` and `aesimc` when `HostFeature::AES` is set, and the PS4 build compiles
+  with `DYNARMIC_ENABLE_CPU_FEATURE_DETECTION=1` (confirmed in the build flags) on a
+  Jaguar, which has AES-NI. The log's `Host CPU: ..., AVX=true` shows the same cpuid
+  path works on the console. Hypothesis closed.
+- its **register cache in the recompiler** is what dynarmic's register allocator
+  already is; no action.
 
 None of those need ACNHRecomp's code — they are one-line-to-one-file changes here.
+
+One number from it is worth carrying forward: the single costliest guest function in
+their profile was the **I3DL2 audio reverb** (`~20%` of samples, a whole core), and
+turning it off took their audio thread from 26% to 11%. Audio is emulated on the same
+weak cores here, so if this port has an equally hot guest function it will show up in
+a guest-side profile — which is what `profile=on` now collects (Run J).
+
+## Run J — the 96 MiB cache measured, and the per-block mprotect
+
+Second gameplay run with the per-core cache (96/64/64/64 MiB). 3,360 frames over
+144.9 s: median 33.12 ms, mean 43.13 ms (23.2 fps), p90 45.6, p95 54.4, p99 139.3,
+worst 4,363.8. 1,048 frames (31.2%) over 34 ms; **33.8 s of the 144.9 s beyond the
+33.3 ms budget (23.3%)**, against 42.0 s of 160.4 s (26.2%) in Run I. So the bigger
+cache is a real but small gain: the 30 Hz grid is still there, and the misses are
+still quantised to 50.0 / 66.7 / 100.0 ms.
+
+Core 0: 430,000 blocks, **3 clears instead of 4**, translate 5.3 s, optimize 4.9 s,
+emit 34.2 s. The clears happened at 9.5 s (boot), 38.8 s (menu/tutorial) and once
+between 38.8 s and 178.8 s. Each sweep is about 157,000 blocks, i.e. the live code of
+one phase is already ~100 MiB: a cache big enough to never clear would need ~300 MiB
+for that core alone, which the console does not have. Bigger is not the answer; _less
+recompiling_ or _cheaper compiling_ is.
+
+### The run is two different problems
+
+The ten-second windows in `eden.log` split cleanly:
+
+| Window | fps | What the game was doing |
+|---|---|---|
+| 77 s | 8.6 | boot, first frames |
+| 87–97 s | 23.6 → 29.9 | settling |
+| 107–157 s | 26.8, 25.3, 28.4, 28.8, 28.8, 29.2 | **free roaming: ~28 fps** |
+| 167–207 s | 18.5, 19.0, 16.3, 12.0, 17.5 | **loading** (31 composites in one 10 s window) |
+
+Free roaming is 28 fps and needs about +8% to hold 30. The collapse after 160 s is not
+translation and not the cache: the block rate stayed at ~4,400 blocks/s and emit was
+39% of that window. It is a load — staging buffers jumped to 36 MiB, the guest heap
+grew by 56 MiB, and the frame log shows 3 fps for ten seconds. Different problem, and
+the profile in the next run is what will name it.
+
+During boot the numbers are the other way round: 11,800 blocks/s at 13 s with emit at
+63% of that window, 300,000 blocks translated by 68 s. Starting the game is almost
+entirely compilation.
+
+### Change: one mapping instead of two mprotect calls per block
+
+`mprotect 7,105 ms` for 430,000 blocks is 16.5 us per block — two
+`sceKernelMprotect` calls for every compiled block (`PS4EnsureWritable` before writing,
+`PS4RestoreExecutable` after), and each one is a TLB shootdown that interrupts the
+other emulation cores, the GPU thread and the audio thread. On three cores that is
+~12 s of the run spent flipping permissions, plus the interference.
+
+The cache is now mapped `PROT_READ | PROT_WRITE | PROT_EXEC` in one call
+(`sceKernelMapNamedFlexibleMemory`), so writing compiled code never changes a
+protection. Safety, in order of what can go wrong:
+
+- If the kernel refuses RWX, the allocator maps RW exactly as before and clears a
+  flag; `PS4EnsureWritable`, `PS4RestoreExecutable` and `PS4Protect` all return early
+  when it is set, so the fallback is the previous behaviour line for line.
+- The flag is global and only set when _every_ allocation got RWX; a buffer that came
+  back RW-only therefore keeps the old window path.
+- Emit timing and the every-5,000-block stats are untouched (the counter moved out of
+  the protection branch), and the stats line now prints the mprotect **call count**, so
+  the next log proves which path ran.
+
+Also switched on for the next run: `profile=on` in `ps4.ini`. The sampler (1 kHz
+`SIGPROF` per thread) writes `PROFILE` lines into `eden.log` with the busiest guest PCs
+and the guest's own AArch64 code at those PCs, which is the same method ACNHRecomp used
+to find its reverb. It costs a little (order 1%) and makes that run's fps slightly
+pessimistic; it is on because knowing where the remaining 8% goes is worth more than a
+clean number.
