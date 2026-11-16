@@ -1661,3 +1661,42 @@ Also fixed the fingerprint problem that cost a day: the startup stamp is main.cp
 `__DATE__/__TIME__`, so a build that changed only other files printed an old time (this run says
 `Nov 16 2026 08:13:27` although the binary was linked at 08:23). `build.sh` now touches
 `main.cpp` before building, so every package reports the build that produced it.
+
+## Run T — the audio period was the speech gate (confirmed)
+
+Same scene as Run S (airport opening, Timmy and Tommy), build `Nov 16 2026 08:41:57`, i.e. the
+512-frame sink:
+
+```
+PS4 AudioOut opened: port=536870919, 48000 Hz stereo, 512 frames/buffer (10.67 ms), 2 guest channels
+```
+
+so the hardware accepted the narrower width and the fallback was not used. Audio drain doubled to
+**942 buffers per 10 s (94.2/s)**, exactly 1/10.67 ms.
+
+Frame-gap histogram, last 800 frames of the run, against the same window from Run S:
+
+| gap | Run S (1024 frames) | Run T (512 frames) |
+| --- | --- | --- |
+| 30–35 ms | 167 | **619** |
+| 40–45 ms | 91 | 39 |
+| 45–50 ms | 149 | 68 |
+| 55–60 ms | 15 | 3 |
+| 95–100 ms | **55** | **1** |
+
+77% of frames are now locked at the 33.35 ms vsync, and the 100 ms speech stall is gone. The
+prediction in Run S held in the direction and in the amount: frames that were pinned at
+2 × 21.33 ms are now pinned at 33.33 + 10.67 ms, and the 4 × 21.33 ms cluster is reduced to a
+single frame. That settles it — the stall was the device's buffer period, not guest-side work.
+
+What is left in the speech scene is a smaller version of the same thing: a frame that must hand
+over one buffer beyond its vsync pays 44 ms. Reducing it further means reducing the *number of
+buffers the guest asks for per frame*, which is the guest's behaviour, not a ring size — and
+shrinking the period again (256 frames = 5.33 ms) would buy at most ~5 ms on those frames at
+double the syscall rate. Not worth it before the larger hitches are handled.
+
+The remaining outliers are asset loads, not pacing: single frames of 1.3 s, 1.4 s, 4.1 s and 4.2 s
+inside the same window. `PS4 guest waits` still reports ~7.0 s per 10 s window blocked in
+`svcWaitSynchronization`, of which `KReadableEvent` is 1,145 calls averaging 6.2 ms — consistent
+with the renderer waiting out the remainder of each 10.67 ms buffer, which now overlaps the other
+cores instead of stalling the frame.
