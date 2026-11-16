@@ -275,7 +275,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Code cache size
 #if defined(__OPENORBIS__)
-    config.code_cache_size = std::uint32_t(64_MiB);
+    // ACNH clears a 64 MiB cache six times in fourteen minutes, and every clear throws away the
+    // translated code it then has to rebuild. 96 MiB halves that against memory the host has.
+    config.code_cache_size = std::uint32_t(96_MiB);
 #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
@@ -363,6 +365,17 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
         config.fastmem_address_space_bits = 64;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+#ifdef __OPENORBIS__
+        // Both settings default to true but only the explicit Unsafe path reads them, so Auto
+        // silently dropped them. They give up bit-exact FP and NaN propagation, which no game
+        // depends on but which costs cycles in every float operation, so honour them here.
+        if (Settings::values.cpuopt_unsafe_reduce_fp_error) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        }
+        if (Settings::values.cpuopt_unsafe_inaccurate_nan) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+        }
+#endif
         break;
     // Paranoia mode for debugging optimizations
     case Settings::CpuAccuracy::Paranoid:

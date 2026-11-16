@@ -267,6 +267,71 @@ Then, over FTP: upload the pkg to `/data/pkg/`, install on the console, launch.
 `eden/src/audio_core/out/` — the four files without which the PS4 target does not
 link. They are force-added; a plain `git status` will not show them.
 
+## Run F — resolution is not the pacer, and the shader cache already works
+
+Two long-held assumptions were tested and killed in this run.
+
+**720p does not help, because the GPU is not the bottleneck.** Handheld mode
+(`docked=0`) makes the game render at 1280x720 instead of 1080p, and output
+resolution was dropped to 720 as well. The frame time did not move:
+
+| Config | Game render res | Frame time | fps | `display wait` | `gpu idle` |
+|---|---|---|---|---|---|
+| docked, output 720 | 1920x1080 | 47.2 ms | 21.2 | 0.0 ms/frame | 0.0 ms/frame |
+| handheld, output 720 | 1280x720 | 42.8–98.2 ms | 13.4–19.9 | 0.0 ms/frame | 0.0 ms/frame |
+
+The renderer never waits for a flip buffer and never falls back to `WaitIdle`.
+Cutting the pixel count by 44% changed nothing, which is exactly what a CPU-bound
+frame looks like. `display wait`/`gpu idle` are the counters added in
+`vk_swapchain_ps4.cpp` (`AcquireNextImage` and `Present`), reported by the heartbeat
+in `yuzu_ps4/main.cpp`.
+
+**The disk shader cache is not recompiling every launch.** A single run's log shows:
+
+```
+[47.635] LoadVulkanPipelineCache: Loaded Vulkan driver pipeline cache
+[47.724] LoadDiskResources: Total Pipeline Count: 430
+```
+
+430 pipelines read back from disk in ~89 ms, and the word "compil" appears exactly
+once in the entire log — an unrelated `Storage buffer failed to track` warning. The
+cache files persist at `/data/EdenPS4/cache/shader/01006f8002326000/`
+(`vulkan.bin` 2.5 MB, `vulkan_pipelines.bin` 986 KB).
+
+What "shader compilation" actually costs here is *first-ever* pipelines: anything not
+yet in the 430 compiles synchronously the first time it is drawn, which is a hitch,
+not a steady-state cost. Because 430 is a small number for a game this large, most of
+ACNH's pipeline set is still unvisited, so new areas keep producing one-time hitches.
+The fix for that is asynchronous pipeline compilation (upstream yuzu's
+"asynchronous shader building"), which does not exist in this tree — `async_shaders`
+has zero consumers here.
+
+### Knobs confirmed dead in this tree
+
+Checked by symbol, not by reading settings UIs:
+
+| Knob | Reality |
+|---|---|
+| `gpu_accuracy` | Only consumed by Qt UI (`yuzu/main_window.cpp`). No renderer reads it. The common "set accuracy to Normal" advice cannot affect this build. |
+| `renderer_force_max_clock` | Consumed, but only at `renderer_vulkan.cpp:187` to request a driver clock boost — meaningless while the GPU is 90%+ idle. |
+| `gpu_use_fast_time` | Does not exist in this tree at all. |
+| `async_shaders` / asynchronous shader building | Does not exist in this tree at all. |
+| `vertex_input_dynamic_state` | Already `true` on non-Android; lever spent. |
+
+### Run F build changes
+
+Both are CPU-side, since the GPU has been ruled out:
+
+1. `core/arm/dynarmic/arm_dynarmic_64.cpp` — `cpuopt_unsafe_reduce_fp_error` and
+   `cpuopt_unsafe_inaccurate_nan` both default to `true`, but the `Auto` accuracy path
+   never read them; only the explicit `Unsafe` path did, so Auto silently dropped them.
+   They are now honoured under `Auto` for `__OPENORBIS__`. This gives up bit-exact FP
+   error flags and NaN propagation — nothing ACNH depends on — in exchange for cheaper
+   float operations, which the game is full of.
+2. Same file — `code_cache_size` 64 → 96 MiB. Run C cleared a 64 MiB cache six times in
+   fourteen minutes; each clear discards translated code that must be rebuilt. Memory
+   is available now (heap plateaued at 368 MiB, ~450 MiB largest free block).
+
 ## Iterating on the console
 
 There is no hot-swap path for code. `/user/app/EDEN00002/` holds only `app.pkg`
