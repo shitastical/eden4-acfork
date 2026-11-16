@@ -1543,3 +1543,90 @@ Measured context for the plateau, from the same session (`eden.previous.log`, t�
 Every thread parked in system time while the frame takes 230 ms says the frame is gated by
 something outside the guest's instruction stream. The two candidate gates are the audio reply (now
 bounded, see above) and the display pipeline, and the null-audio run is what separates them.
+
+## Where the resources actually go (measured, not estimated)
+
+All numbers below are from the 762 s session in `/tmp/acnhlog3` (old 96/64/64/64 binary),
+because that is the only run with full JIT statistics. They are quoted with the log line they
+come from so a later run can falsify them.
+
+### Budget
+
+| consumer | size | source |
+| --- | --- | --- |
+| guest RAM | 3648 MiB | `k_system_control.cpp` — already trimmed from 4 GiB |
+| JIT code caches | 288 MiB | `PS4 JIT: N KiB in regular flexible memory at …` ×4 |
+| host heap | main pool + **544 MiB in separate overflow regions** by t≈740 s | `overflow heap=` in `PS4 progress` |
+| Piglet (GPU) reserve | ~255 MiB regular flexible memory | `ps4_runtime.cpp` comment at the pool pick |
+
+So 3648 MiB of the console's 4608 MiB is guest, and *everything* else — JIT, C heap, GPU pool,
+stack — shares the remaining 960 MiB. The JIT caches are therefore not free memory in the sense
+that "there is plenty left"; they are 30% of a scarce budget.
+
+### 1. The fourth core never uses its code cache
+
+`PS4 JIT 0x2f2030000` produces exactly one line in the whole session: the allocation. Not one
+`PS4LogStats` line, so it never translated even 5000 blocks. Core 3 has no guest work in this
+game, and its reservation was 64 MiB of contiguous flexible memory doing nothing (16 MiB in the
+new split). Lazy allocation — reserve on the first block that core actually translates — returns
+the whole amount on titles that use fewer cores, at the cost of one allocation in `MakeJit`.
+Risk: a core that starts translating late pays the allocation then; that is a one-off 64 MiB
+`sceKernelMapFlexibleMemory`, far cheaper than the current permanent footprint.
+
+### 2. Cache density is ~0.75 KiB/block, not the 9.2 KiB I assumed
+
+Core 0 executed 510,000 blocks with 3 cache clears in 96 MiB, i.e. ~127,500 blocks per fill, so
+~0.75 KiB per block. Core 1's 7th clear logged **240,602 blocks live** at 64 MiB, ~0.27 KiB/block
+(cold blocks are smaller). The earlier note in this file that a 64 MiB cache holds ~7,300 blocks
+was wrong by more than an order of magnitude, and the 96/128/48/16 split was argued from it.
+
+The split still points the right way — core 1 cleared 7 times, which no other core did, and
+128 MiB roughly halves that — but the true working set is far larger than any cache we can
+afford: ~680,000 blocks live on core 1 over the session. **More cache cannot remove clearing;
+it only reduces the rate.** The real lever is cost per block:
+
+| phase | ms (510k blocks) | µs/block |
+| --- | --- | --- |
+| translate | 5,614 | 11.0 |
+| optimize | 6,061 | 11.9 |
+| emit | 37,109 | 72.8 |
+| total | 48,784 | 95.7 |
+
+One full 96 MiB re-translation is ~12 s of CPU; seven of those on core 1 is the load stall we
+have been chasing. Emit is 76% of the JIT cost. Before optimizing emit, measure it: a per-block
+`steady_clock` read on this platform may itself be tens of microseconds, in which case the
+counter is measuring its own instrumentation and the whole table is suspect.
+
+### 3. Host heap overflow is the contiguous-memory problem
+
+`overflow heap=` grows 88 → 152 → 264 → 296 → 328 → 360 → 392 → 480 → **544 MiB** and is still
+growing at the plateau. Each step is a *new* flexible-memory mapping (`registerOverflow`, up to
+32 of them) because the main pool could not satisfy the request. That is exactly why
+`largest free direct block` sits at 319–327 MiB while ~960 MiB is nominally free: the remainder is
+scattered in 32-64 MiB pieces. Freeing core 3's cache and allocating the JIT caches lazily makes
+the largest free block bigger by that amount, which is what the Vulkan side and the C heap both
+need.
+
+### 4. `emulation speed 100%` is not a health signal
+
+`perf_stats.cpp`: `emulation_speed = (guest time advance) / (wall time)`. With multicore the timing
+thread advances guest time in lock-step with the wall clock, so a guest that is parked produces
+"100%". The plateau line reads `4.3 fps, emulation speed 100%, frame time 230.7 ms,
+display wait 0.0 ms/frame, gpu idle 0.0 ms/frame` — the last two being zero says the frame is not
+lost in present/GPU queueing, and 100% speed says nothing at all. Judge every future change by
+frame time and `PS4 guest waits`, never by that percentage.
+
+### 5. Guest memory slow-path volume
+
+234.4 M callbacks in 741 s, ~316k/s. `MemoryRead`/`MemoryWrite` in `arm_dynarmic_64.cpp` count
+every access that did not get inlined. At ~100 ns each that is ~3% of one core; worth watching but
+not the plateau.
+
+### What to measure next, before changing anything else
+
+1. Per-core cache high-water: log bytes used at each clear, so sizing is read off the log instead
+   of guessed. (Log-only, no behaviour change.)
+2. Route the existing `heapLog` overflow lines into `eden.log` (they currently go elsewhere) and add
+   count/largest to `PS4 progress`, so the 544 MiB can be attributed to a subsystem.
+3. Time emit without a clock read per block (accumulate around the whole batch) to check whether the
+   72.8 µs/block is real.
