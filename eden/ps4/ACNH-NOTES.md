@@ -1221,3 +1221,126 @@ Together with the corrected block map, the next run answers the last open questi
 - `KThread` dominating ⇒ core 0 waits for the guest's worker threads,
 - neither (waits stay small) ⇒ the frame really is ~43 ms of guest execution, and the
   remaining gap to 33.3 ms is translation speed, which no setting can buy back.
+
+## Research — what ACNHRecomp tells us, and two measurements it pointed at
+
+ACNHRecomp (`Nycolazs/ACNHRecomp`, MIT, built on the SuperMarioWonderRecomp framework) is a
+*static* recompilation of this exact title: 178,127 functions and 16.4 M AArch64 instructions
+of `main` (75 MiB) plus `sdk` (1.67 M) and `subsdk0` (0.9 M), emitted as 1.4 GB of C++ and
+compiled for the host, with NVN calls rewritten to Vulkan and 6,200 shader blocks translated
+to SPIR-V. It is a different product, not something this fork can adopt: it replaces the
+console, has no PS4 port, and its generated C++ needs far more toolchain than an eboot on a
+1.6 GHz Jaguar. What follows is what its documentation is worth to an emulator — and one item
+that measurably is not worth anything here.
+
+### Its map of the frame loop (borrowed)
+
+`docs/NATIVE60.md` identifies the engine as sead + agl + gsys with `sead::GameFrameworkNx`:
+
+| Address (`main`) | Role |
+|---|---|
+| `+37b8bf0` | `sead::MainThread` loop: `for (;;) this->procFrame_()` |
+| `+37b8c14` | `procFrame_`: `procDraw_`, `procCalc_`, then **wait/present** (vtable+0x70) |
+| `+37b8d1c` | `procDraw_`: writes the frame's command lists |
+| `+37b90e4` | `procCalc_`: `ControllerMgr`, then the whole method tree (`sead::MethodTreeNode::call`) |
+| `+37e3300` | `sead::Thread` message loop of the calc threads (UI `+3c5bb1c`, jobs); presents at `+37b91a4` |
+
+So a slow frame on CPUCore_0 has three candidate regions, and the profile can name the one
+that costs 10 ms. It also means the game is not a tight 30 Hz loop we can "just let run":
+the wait/present step is *inside* the frame.
+
+### The frame is the clock (borrowed, and it constrains us)
+
+The same document measures that ACNH's logic advances **per frame**, not per second: a line of
+dialogue types at ~1.4 characters per frame whether the game presents at 30 or at 60, and
+presenting at 60 makes the whole game twice as fast. Only load screens follow the wall clock
+(`nn::time`). Its 60 fps work is therefore hundreds of places that count frames.
+
+For us that settles a question worth not re-litigating: **the fork must present at 30 Hz.**
+Raising the presentation rate to buy smoothness would speed the game up rather than fix it,
+and letting the frame run free would make 31 fps play 3% fast. The target is 33.3 ms, period.
+
+### Its performance findings, mapped onto ours
+
+- *NVN replay is their frame cost*: 31–34 ms of CPU for ~4,900 draws on a Snapdragon 865
+  (~6.6 µs a draw), 46% of cycles stalled on memory, and 15–20 ms of a 33 ms frame on an Iris
+  Xe. Their parallel-replay attempt failed (45–63 ms of CPU against 28 ms) because per-thread
+  descriptor caches and upload rings duplicated the shared work.
+  **Ours is not this.** The `GPU` thread spends 13.0% of the frame in host code (~5.7 ms of
+  43.7 ms) and `VulkanWorker` 7.4% (~3.2 ms), both diffuse (top address 0.2%), and `radv` is a
+  real driver with a real queue. Parallel replay would add risk for a cost we do not have.
+- *Software reverb is a whole core on weak hardware*: their audio thread spent ~20% of all
+  samples in the I3DL2 reverb before they bypassed it (26% → 11%).
+  **We have the same thread**: `DSP_AudioRenderer_Main` (our HLE AudioRenderer,
+  `audio_core/adsp/apps/audio_renderer`) runs at 14.1% host + 85.9% parked, i.e. ~6.2 ms of
+  host CPU per frame. It is *not* on the critical path unless the guest's main thread waits on
+  it — a `KThread`/`KSemaphore` line in Run O's new breakdown would be the first evidence that
+  it is, and only then is bypassing the reverb worth a build.
+- *Lost wakeups*: their problem 23 is a real kernel semantics bug — `svcWaitSynchronization`
+  must keep a `CancelSynchronization` **pending** until a wait consumes it, because that is how
+  `nn::os::MultiWait` wakes waiters; dropping it loses wakeups at random. **Checked, ours is
+  already correct**: `KThread::WaitCancel` sets `m_wait_cancelled` and
+  `KSynchronizationObject::Wait` consumes it before linking waiters
+  (`k_synchronization_object.cpp:116`). Nothing to fix.
+- *Register cache*: their recompiler fix took a hot function from 9.7 µs to 4.1 µs by keeping
+  guest registers in C++ locals instead of reloading them from memory at every call.
+  **Dynarmic already does more than this** inside a block, and the residue is measurable and
+  small: the hottest host address on the guest cores is
+  `ABI_PushRegistersAndAdjustStack` (`abi.cpp`) at 1.8% + 1.2% — about 3% of a core, i.e. the
+  per-block prologue/epilogue, not a correctness problem and not a lever worth restructuring
+  dynarmic's block model for.
+- *Memory budget*: their problem 13 — the engine's `cSys` budget overran because task heaps were
+  built from "the rest" and trimmed later in a different order than the console — is the same
+  shape as our wall: ACNH sizes heaps off a budget, and ours is a guest that reserves 4 GiB of
+  a 4.5 GiB console, which is why the code cache cannot grow.
+
+### What the existing logs already say (no console needed)
+
+`frames.log`, 484 s session, 11,013 frames, mean 43.9 ms:
+
+| gap | share |
+|---|---|
+| 30–33.4 ms | 33.0% |
+| 33.4–36 | 18.1% |
+| 36–40 | 8.8% |
+| 40–45 | 21.5% |
+| 45–50 | 13.1% |
+| >50 | 5.5% |
+
+A third of all frames land at 30–33.4 ms — i.e. on the 30 Hz boundary — and the last 40% of
+the session has *no* frame under 33.4 ms at all (46.9% at 40–45, 25.9% at 45–50, mean 44.9).
+Nothing clusters at 66.6 ms, so frames are not being quantised to every second vsync. The
+game is work-bound at ~44 ms with a spread; it is not dropping to 15 fps.
+
+`buffer_wait_us` is the other half of that: `vk_swapchain_ps4.cpp` times the poll in
+`AcquireNextImage` (up to 1000 × 1 ms waiting for `sceVideoOutGetFlipStatus` to advance), and
+the heartbeat prints `display wait 0.0 ms/frame` for the whole session. **The display path is
+not the blocker** — buffers are always free when we ask for one, so the guest's ~10 ms park
+cannot be the video-out swap. `gpu_idle 0.0 ms/frame` likewise says the queued-flip path never
+falls back to `WaitIdle`.
+
+Which leaves the guest's own synchronisation as the only candidate for the 10 ms, and that is
+exactly what Run O measures. The expected reading is a `KThread`/`KSemaphore` class at ~10 ms —
+core 0 waiting for `CPUCore_1`/`CPUCore_2` to finish a job — with those cores' real busy share
+finally visible now that the block map holds a whole generation.
+
+Per-thread wall-clock shares for a steady gameplay window (t=231 s, 500 Hz sampling of every
+thread, so these are shares of the frame, not CPU):
+
+| thread | host | parked |
+|---|---|---|
+| CPUCore_0 | 9.7% (4.2 ms) | 23.1% (10.1 ms) |
+| CPUCore_1 | 12.6% (5.5 ms) | 37.3% |
+| CPUCore_2 | 12.2% (5.3 ms) | 47.7% |
+| CPUCore_3 | 0% | 100% |
+| GPU | 13.0% (5.7 ms) | 86.8% |
+| VulkanWorker | 7.4% (3.2 ms) | 92.6% |
+| HostTiming | 26.6% (11.6 ms) | 73.4% |
+| DSP_AudioRenderer_Main | 14.1% (6.2 ms) | 85.9% |
+| VSyncThread, PS4AudioOut | ~0% | ~100% |
+
+`HostTiming` at 26.6% host is the largest single host number in the run, but it is diffuse
+(top address 2.4%, then ≤0.7%): it is event dispatch and locking spread across many small
+functions, not a hot spot to attack. With eight host cores and four guest threads, extra host
+threads do not lengthen the frame unless the main thread waits on one — again, Run O's
+breakdown decides.
