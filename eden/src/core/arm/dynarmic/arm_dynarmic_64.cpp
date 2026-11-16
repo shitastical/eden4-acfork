@@ -311,15 +311,26 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // The cache is allocated from *flexible* memory, so it competes with the C heap and Vulkan for
     // whatever the guest DRAM left over. Four 96 MiB caches (384 MiB) did not fit: the fourth
     // allocation failed with 0x8002000c (ENOMEM) and the resulting std::bad_alloc aborted the
-    // process. 288 MiB total is known to allocate, so the first core (which translates by far the
-    // most guest code: 430k blocks in a 3 minute run, against 55-100k for the others) gets 96 MiB
-    // and the rest keep 64. The clears counted in the stats are the guest's own `IC IALLU`, not
-    // capacity, so a bigger cache only delays a capacity clear rather than removing those; see
-    // ACNH-NOTES.md Run K. ps4.ini "jit_cache_mb=N" overrides the size for experiments.
+    // process. 288 MiB total is known to allocate, so that is what these sizes add up to and the
+    // only thing that changes here is which core holds what.
+    //
+    // A clear counted below is a *capacity* clear (`SpaceRemaining() < 1 MiB` in the interface, which
+    // forces a full one), not a guest `IC IALLU`: this game flushes its instruction cache zero times
+    // in a session (Run N). Run P is what those numbers look like -- core 1 fills its 64 MiB and wipes
+    // it every 11.8 s, over and over, through the island load. Blocks are large on that core
+    // (the loader's decompression and parsing: ~9 KiB of host code each, against ~0.5 KiB on the
+    // core 0 game loop), so 64 MiB is only ~7300 of them and the working set does not fit. Cores 0
+    // and 2 barely clear at 96 and 48; core 3 never ran a single guest sample, so it holds a small
+    // cache that is enough to run if the guest ever schedules a thread there.
+    constexpr std::uint32_t kDefaultCacheMb[4] = {96, 128, 48, 16};
     const std::uint32_t configured_mb = Common::PS4Diagnostics::jit_cache_mb.load();
-    config.code_cache_size =
-        configured_mb != 0 ? configured_mb * 1024u * 1024u
-                           : std::uint32_t(m_core_index == 0 ? 96_MiB : 64_MiB);
+    const std::uint32_t configured_core_mb =
+        m_core_index < 4 ? Common::PS4Diagnostics::jit_cache_mb_core[m_core_index].load() : 0;
+    const std::uint32_t size_mb = configured_core_mb != 0  ? configured_core_mb
+                                 : configured_mb != 0      ? configured_mb
+                                 : m_core_index < 4 ? kDefaultCacheMb[m_core_index]
+                                                    : 64u;
+    config.code_cache_size = size_mb * 1024u * 1024u;
 #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else

@@ -255,9 +255,21 @@ std::vector<Option> g_options = {
      "Diagnostics: Off uses Dynarmic's original register allocation.", "debug",
      {{"on", "On"}, {"off", "Off"}}},
     {"jit_cache_mb", "JIT code cache (MiB)",
-     "Per core; 0 uses 96 on the first core and 64 on the others. A cache that is too small clears "
-     "itself and re-compiles everything, which shows up as multi-second stalls.", "advanced",
+     "Every core; 0 uses the built-in 96/128/48/16. A cache that is too small clears itself and "
+     "re-compiles everything, which shows up as multi-second stalls.", "advanced",
      {{"0", "Auto"}, {"64", "64"}, {"96", "96"}, {"128", "128"}, {"160", "160"}}},
+    {"jit_cache_mb0", "JIT code cache, core 0 (MiB)",
+     "Overrides jit_cache_mb for core 0 only; 0 keeps that core's built-in size.", "advanced",
+     {{"0", "Auto"}, {"64", "64"}, {"96", "96"}, {"128", "128"}, {"160", "160"}}},
+    {"jit_cache_mb1", "JIT code cache, core 1 (MiB)",
+     "Overrides jit_cache_mb for core 1 only; 0 keeps that core's built-in size.", "advanced",
+     {{"0", "Auto"}, {"64", "64"}, {"96", "96"}, {"128", "128"}, {"160", "160"}}},
+    {"jit_cache_mb2", "JIT code cache, core 2 (MiB)",
+     "Overrides jit_cache_mb for core 2 only; 0 keeps that core's built-in size.", "advanced",
+     {{"0", "Auto"}, {"64", "64"}, {"96", "96"}, {"128", "128"}, {"160", "160"}}},
+    {"jit_cache_mb3", "JIT code cache, core 3 (MiB)",
+     "Overrides jit_cache_mb for core 3 only; 0 keeps that core's built-in size.", "advanced",
+     {{"0", "Auto"}, {"16", "16"}, {"64", "64"}, {"96", "96"}}},
 };
 #undef CONTROLLER_TYPES
 
@@ -315,6 +327,10 @@ void ApplyOptions() {
     ps4_block_reuse = enabled("block_reuse");
     ps4_regalloc_free_moves = ps4_regalloc_r13 = enabled("regalloc");
     Common::PS4Diagnostics::jit_cache_mb = static_cast<u32>(std::strtoul(OptionValue("jit_cache_mb"), nullptr, 10));
+    for (size_t core = 0; core < 4; core++) {
+        Common::PS4Diagnostics::jit_cache_mb_core[core] = static_cast<u32>(std::strtoul(
+            OptionValue(fmt::format("jit_cache_mb{}", core)), nullptr, 10));
+    }
     auto& players = Settings::values.players.GetValue();
     for (size_t port = 0; port < OrbisFrontend::Controller::MaxPads; ++port) {
         const std::string_view type = OptionValue(fmt::format("player{}_type", port + 1));
@@ -509,14 +525,24 @@ void DrainProfiler(Core::System& system) {
         if (std::find(dumped.begin(), dumped.end(), pcs[i]) != dumped.end())
             continue;
         dumped.push_back(pcs[i]);
-        u32 code[48];
+        // A hot PC sits inside a loop, and what happens to that loop has to be decided from the
+        // code around it: 1.5 KiB back reaches the enclosing function's prologue (how it is
+        // entered, which registers it takes), 0.5 KiB forward covers the loop exit.
+        constexpr u64 kBefore = 0x600;
+        constexpr u64 kLength = 0x800;
+        const u64 start = (pcs[i] & ~u64{3}) - kBefore;
+        u32 code[kLength / sizeof(u32)];
         auto& memory = system.ApplicationMemory();
-        if (!memory.IsValidVirtualAddressRange(pcs[i], sizeof(code)) || !memory.ReadBlockUnsafe(pcs[i], code, sizeof(code)))
+        if (pcs[i] < kBefore || !memory.IsValidVirtualAddressRange(start, sizeof(code)) ||
+            !memory.ReadBlockUnsafe(start, code, sizeof(code)))
             continue;
-        std::string hex;
-        for (const u32 word : code)
-            hex += fmt::format("{:08x} ", word);
-        LOG_INFO(Frontend, "PROFILE code 0x{:x}: {}", pcs[i], hex);
+        LOG_INFO(Frontend, "PROFILE code 0x{:x} ({} bytes back from the hot PC):", pcs[i], kBefore);
+        for (size_t index = 0; index < std::size(code); index += 8) {
+            std::string hex;
+            for (size_t word = index; word < index + 8; word++)
+                hex += fmt::format("{:08x} ", code[word]);
+            LOG_INFO(Frontend, "PROFILE code 0x{:x}: {}", start + index * sizeof(u32), hex);
+        }
     }
 }
 

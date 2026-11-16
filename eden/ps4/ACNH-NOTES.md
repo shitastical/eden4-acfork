@@ -1344,3 +1344,98 @@ thread, so these are shares of the frame, not CPU):
 functions, not a hot spot to attack. With eight host cores and four guest threads, extra host
 threads do not lengthen the frame unless the main thread waits on one — again, Run O's
 breakdown decides.
+
+## Run P — startup and the island load are the same problem: the JIT cache
+
+Reported from the console: startup takes up to a minute, and the island load after talking to
+Timmy and Tommy never finished. Both are one phenomenon, and it is not I/O.
+
+Four things were eliminated before touching anything:
+
+- **Not a deadlock, and not stalled I/O.** Frames keep being produced all through the load,
+  ~230 ms apart (4.3 fps), with the fps counter still moving. A stuck loader would show frames
+  that take *zero* time (parked on a fence) or no frames at all.
+- **Not the display path.** `buffer_wait_us` and `gpu_idle` are 0.0 ms/frame for the whole
+  session, including the load — the swapchain is never the thing being waited on.
+- **Not the profiler.** `ps4_jit_block_register` is O(1); the per-block hook does not scale with
+  anything.
+- **Not cycle counting.** `uses_wall_clock = IsMulticore()` and we run multicore, so
+  `enable_cycle_counting` is already off and `CNTPCT` is read from the host clock. There is no
+  per-instruction tick to strip out.
+
+### The numbers from the session
+
+| core | cache | blocks compiled | time in the emitter | capacity clears |
+|---|---|---|---|---|
+| 0 | 96 MiB | 510,000 | 37.0 s | 3 |
+| 1 | 64 MiB | 425,000 | **246.5 s** | **32** |
+| 2 | 64 MiB | 70,000 | 6.6 s | 1 |
+| 3 | 64 MiB | 0 | 0 | 0 |
+
+Core 1 is where the load lives, and it is not subtle: at t=1061 s it is 83.9% host system time
+(inside dynarmic's emitter) while the frame rate is 4.3 fps. The clears on that core are exactly
+periodic — 26, 27, 28 … at 1004.4, 1016.3, 1028.1, 1039.9, 1051.7, 1063.6, 1075.4, 1087.2 s,
+one every 11.8 s — and each one reports ~7,300 more cumulative blocks than the last. So the
+64 MiB cache holds **~7,300 blocks on this core**, i.e. **9.2 KiB of host code per block**.
+
+That is the whole story. Nine kilobytes per block is 16× what core 0 needs (96 MiB / ~170k
+blocks = 0.58 KiB): the loader's decompression and parsing code compiles into huge blocks, so
+64 MiB buys about 30 s of loader before it fills. The island load streams far more new code than
+that, so the cache fills *in the middle of the load*, throws away everything it has — including
+the boot-time code it just compiled — and starts again. Refilling costs ~7.5 s of pure emit
+(7,300 × 1.03 ms), which is why the load appears to restart, and why it can take longer to load
+an island than a session lasts.
+
+Against the whole guest image this is stark: 425,000 compiles × 9.2 KiB = **3.8 GiB of host code
+from a 92 MiB guest image**. Even if every distinct block in the image were 9 KiB (430 MiB of
+host code), the cache could only ever hold a fraction of it, so the great majority of those
+425,000 compiles are re-emissions of code this core had already compiled and then discarded.
+
+### What changed
+
+The same 288 MiB, redistributed to the cores that actually use it:
+
+| core | before | after |
+|---|---|---|
+| 0 | 96 MiB | 96 MiB |
+| 1 | 64 MiB | **128 MiB** |
+| 2 | 64 MiB | 48 MiB |
+| 3 | 64 MiB | **16 MiB** |
+
+Core 3 has never run a single guest sample in any window of any run (100% parked), so 64 MiB
+there was pure waste; moving half of it plus 16 MiB of core 2 doubles the core that is stuck.
+Total is unchanged, which matters: this is flexible memory competing with the C heap and Vulkan,
+and 384 MiB total already failed with `ENOMEM` (0x8002000c), so the rebalance is the only
+direction available without new machinery.
+
+`ps4.ini` gained per-core overrides — `jit_cache_mb0` … `jit_cache_mb3` — with `0` keeping that
+core's built-in size, so the split can be tried differently (e.g. 160 on core 1) without a
+rebuild. `jit_cache_mb` still sets all four at once.
+
+### Why the wall is where it is
+
+`PS4CodeAllocator::alloc` maps the entire cache up front with `sceKernelMapNamedFlexibleMemory`,
+so the size is committed in full the moment a core starts — that is why 384 MiB died at
+allocation rather than gradually. The guest reserves 4 GiB of the console's 4.5 GiB, leaving
+~600 MiB of direct memory for four code caches, the C heap, Vulkan and the texture cache
+together, and the island load previously died with `std::bad_alloc` when the heap was squeezed
+harder than this.
+
+If 128 MiB on core 1 turns out not to be enough, the fix is **reserve-then-map**: reserve a
+large virtual range once and map flexible memory a few MiB at a time as the emitter reaches it,
+so a 512 MiB cache costs only its resident working set (~100–200 MiB) instead of 512 MiB of
+committed RAM. That needs new kernel calls and a page-window path in `BlockOfCode`, i.e. it is a
+change to how code memory is managed, not a constant — so it is not in this build.
+
+### What to look for in the log
+
+- `cache clear N` for `0x2ea02c000` (core 1): during play this should go to ~0 instead of ~33 a
+  session, and the island load should finish rather than loop.
+- Startup: everything before the first frame is boot-time compilation, so the same number
+  predicts it — if core 1 still clears during boot, the cache is still too small for this code.
+- `PS4 JIT` lines: total `emit` for core 1 should fall by roughly the fraction of clears that
+  disappear (each avoided clear is ~7.5 s of emit).
+
+The widened dump from this build (`PROFILE code` now prints 0x800 bytes starting 0x600 before
+each hot PC, as 8-word lines) is there to identify the loader's inner loops if the cache change
+is not enough; it has not been analysed yet.
