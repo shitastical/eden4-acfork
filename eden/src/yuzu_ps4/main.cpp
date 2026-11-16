@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <dirent.h>
 #include <map>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,6 +47,8 @@
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "video_core/gpu.h"
+#include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_base.h"
 #include "yuzu_ps4/platform.h"
 #include "yuzu_ps4/ui_canvas.h"
 #include "yuzu_ps4/ui_launcher.h"
@@ -313,9 +317,9 @@ void SetDefaults() {
     Settings::values.cpu_backend.SetValue(Settings::CpuBackend::Dynarmic);
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
     Settings::values.sink_id.SetValue(Settings::AudioEngine::Ps4);
-    Settings::values.use_disk_shader_cache.SetValue(false);
+    Settings::values.use_disk_shader_cache.SetValue(true);
     Settings::values.async_presentation.SetValue(false);
-    Settings::values.log_flush_line.SetValue(true);
+    Settings::values.log_flush_line.SetValue(false);
     Settings::values.log_filter.SetValue("*:Info");
     Settings::values.udp_input_servers.SetValue("");
     LoadOptions();
@@ -505,8 +509,10 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
         ps4_sampler_enable_block_map();
         ps4_sampler_start();
     }
-    // 4 GiB of guest RAM leaves ~512 MiB of direct memory; keep it for the GPU, not the C heap.
-    ps4_heap_set_overflow_gpu_reserve(256ull << 20);
+    // 4 GiB of guest RAM leaves ~512 MiB of direct memory. Reserving half of it for the GPU capped
+    // the C heap at 248 MiB, where tending the pipeline cache ran it into std::bad_alloc while
+    // direct memory was still free; 128 MiB keeps the GPU a share and lets the heap grow past that.
+    ps4_heap_set_overflow_gpu_reserve(128ull << 20);
     Common::PS4Diagnostics::LogDirectMemory("before guest RAM");
     const auto previous_renderer = Settings::values.renderer_backend.GetValue();
     Settings::values.renderer_backend.SetValue(game.renderer.value_or(previous_renderer));
@@ -548,6 +554,13 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
     system.RegisterExitCallback([&] { running = false; });
     system.GPU().Start();
     system.GetCpuManager().OnGpuReady();
+    // Reuse the pipelines earlier sessions compiled. Without this every launch recompiles every
+    // pipeline the game touches, which is the long stall on the loading screen.
+    if (Settings::values.use_disk_shader_cache.GetValue()) {
+        system.Renderer().ReadRasterizer()->LoadDiskResources(
+            system.GetApplicationProcessProgramID(), std::stop_token{},
+            [](VideoCore::LoadCallbackStage, size_t, size_t) {});
+    }
     void(system.Run());
     LOG_INFO(Frontend, "Emulation running; L3 + R3 + Options requests shutdown");
     Common::PS4Diagnostics::LogDirectMemory("after renderer startup");
