@@ -80,9 +80,11 @@ the game in `games/` as soon as the app starts: the launcher scans, matches the
 played file against `Ps4Paths::GameTitleId` (falling back to `01006f8002326000` or
 "animal crossing" in the file name before the metadata reader has run), and skips
 the menu entirely. If no matching file is found it logs a warning and shows the
-normal menu instead of failing. To reach the emulator menus, set `autolaunch=0` in
-`/data/ACNH/ps4.ini` (or turn it off under Display in System Settings inside the
-app) and restart.
+normal menu instead of failing. It is a start-up behaviour, not a loop behaviour:
+the flag is consumed by the first launch, so quitting the game lands on the menu
+rather than booting it again. To reach the emulator menus on the next start, set
+`autolaunch=0` in `/data/ACNH/ps4.ini` (or turn it off under Display in System
+Settings inside the app) and restart.
 
 **Per-frame log.** `framelog=1` (default) appends `frame,gap_ms` to
 `logs/frames.log` from `Swapchain::Present` — the wall-clock gap since the previous

@@ -1066,6 +1066,9 @@ void Launcher(OrbisFrontend::Controller& controller) {
     Ui::Launcher ui{host};
     MenuInput input;
     std::string message;
+    // Auto-launch is a start-up behaviour, not a loop behaviour: once the game has been started
+    // (or wasn't found), quitting it has to land on the menu, not boot it again.
+    bool autolaunch_pending = std::strcmp(OptionValue("autolaunch"), "1") == 0;
     while (true) {
         auto display = std::make_unique<OrbisFrontend::Display>();
         if (const auto mode = OrbisFrontend::WorkingDisplayMode())
@@ -1078,7 +1081,6 @@ void Launcher(OrbisFrontend::Controller& controller) {
         auto last = std::chrono::steady_clock::now();
         int launch = -1;
         u64 frames = 0;
-        bool autolaunch_pending = std::strcmp(OptionValue("autolaunch"), "1") == 0;
         while (true) {
             // Single-game fork: boot ACNH without showing the menu, unless the flag is off.
             if (autolaunch_pending && frames == 0) {
