@@ -1439,3 +1439,64 @@ change to how code memory is managed, not a constant — so it is not in this bu
 The widened dump from this build (`PROFILE code` now prints 0x800 bytes starting 0x600 before
 each hot PC, as 8-word lines) is there to identify the loader's inner loops if the cache change
 is not enough; it has not been analysed yet.
+
+## Run Q — the build that ran was older than the build that was uploaded
+
+The log from the run after the cache rebalance shows allocations of `98320 / 65552 / 65552 /
+65552 KiB`, i.e. the old 96/64/64/64 split, and `cache clear` counts on core 1 of 7 instead of
+the ~33 seen before. Either of those alone is ambiguous, but the options line settles it:
+
+```
+Frontend <Info> yuzu_ps4/main.cpp:525:RunGame: PS4 options: ... jit_cache_mb=0
+```
+
+`main.cpp:525` is an older line number for `OptionsSummary`, the summary contains no
+`jit_cache_mb0..3` keys at all, and it contains no `audio=` key. The schema that prints those
+keys only exists *after* the cache commit, so that eboot predates it. Note the asymmetry that
+makes this a trap: **an option that does not exist yet prints nothing**, so a stale binary looks
+exactly like a new binary with default options.
+
+Two consequences.
+
+1. Nothing in that log tests the rebalance. The 96/128/48/16 split has not run on hardware yet.
+2. A log cannot be trusted to identify its own binary. The version in `param.sfo` does not help
+   because the install flow here is uninstall-then-install, which replaces the app regardless of
+   version. So `RunGame` now logs `PS4 build: <__DATE__ __TIME__>` — the compile time of the
+   frontend object — as the first line of every run. It is the only field that cannot be
+   inherited from a stale binary's defaults.
+
+The same log also shows why one instrument went unused: `PS4 atomics` printed 75 times and
+`PS4 guest waits` printed zero times, in a build that contained both. The wait line was inside
+`if (blocked_calls != 0)`, so "the hook never fires" and "the guest never blocks" produce the same
+silence. It is now logged every window unconditionally; a run with many heartbeats and
+`0 waits` means the hook in `svcWaitSynchronization` is dead and must be fixed before the number
+means anything.
+
+### What the frame log says about the speech windows
+
+Six sessions, 49,252 frames, gaps bucketed (`frames.log`):
+
+| feature | value |
+| --- | --- |
+| locked stretches | 33.35 ms mean, 0.48 ms stdev — the 30 fps frame lock, hit |
+| "slightly slow" mass | 40–50 ms, broad, not quantised |
+| speech pin | 100.05 ms mean, 0.9 ms stdev |
+| gaps > 55 ms that are within 2 ms of a 33.33 multiple | 21–27% |
+
+So the 100 ms plateau is **not** the general shape of a slow frame. A frame that merely runs
+long is 40–50 ms and lands anywhere; the speech frames sit on a 100.0 ms period repeatable to a
+millisecond. A repeatability that tight is a clock, not work: work varies by more than 0.9 ms
+between frames, which is visible in the 0.48 ms spread of the *locked* frames and in the 40–50 ms
+band. The open question is which clock, and the candidates are the audio device (1024-frame
+buffers, 21.3 ms each) or the guest's own 100 ms timer; 100.0 is also exactly three 33.33 ms
+present slots, so "two missed vsync slots" cannot be excluded from this data alone.
+
+`audio=off` in `ps4.ini` selects `AudioEngine::Null` for exactly this test: it keeps the guest's
+own audio renderer running (so the dialogue pipeline, the string work and the `os::Mutex` traffic
+all stay) but removes the device, its 21.3 ms buffer period and every wait on it. If the pin
+follows the device, frames during speech move off 100.0 ms and the plateau changes shape. If it
+does not move, the pin is guest-side and the audio sink is innocent — which is worth knowing
+before touching `ps4_sink.cpp`, because a shorter buffer costs submit overhead on every frame of
+every scene to fix something that may not be there.
+
+The default is `audio=on`, i.e. the normal path, so leave it out of `ps4.ini` except for the test.

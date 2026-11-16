@@ -254,6 +254,9 @@ std::vector<Option> g_options = {
     {"regalloc", "JIT register tweaks",
      "Diagnostics: Off uses Dynarmic's original register allocation.", "debug",
      {{"on", "On"}, {"off", "Off"}}},
+    {"audio", "Audio output",
+     "Turn audio off to check whether a slow scene is waiting on the audio device.", "audio",
+     {{"on", "On"}, {"off", "Off"}}},
     {"jit_cache_mb", "JIT code cache (MiB)",
      "Every core; 0 uses the built-in 96/128/48/16. A cache that is too small clears itself and "
      "re-compiles everything, which shows up as multi-second stalls.", "advanced",
@@ -326,6 +329,11 @@ void ApplyOptions() {
     ps4_page_reuse = enabled("page_reuse");
     ps4_block_reuse = enabled("block_reuse");
     ps4_regalloc_free_moves = ps4_regalloc_r13 = enabled("regalloc");
+    // Audio output can be switched off to tell whether a slow scene is waiting on the audio
+    // device (the guest's renderer still runs; nothing is played and nothing paces it).
+    Settings::values.sink_id.SetValue(std::string_view{OptionValue("audio")} == "off"
+                                          ? Settings::AudioEngine::Null
+                                          : Settings::AudioEngine::Ps4);
     Common::PS4Diagnostics::jit_cache_mb = static_cast<u32>(std::strtoul(OptionValue("jit_cache_mb"), nullptr, 10));
     for (size_t core = 0; core < 4; core++) {
         Common::PS4Diagnostics::jit_cache_mb_core[core] = static_cast<u32>(std::strtoul(
@@ -548,6 +556,9 @@ void DrainProfiler(Core::System& system) {
 
 void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
     LOG_INFO(Frontend, "Launching {}", game.path);
+    // Compile time of this frontend object: the only way a log can say which eboot produced it.
+    // The options line alone cannot, since an option that does not exist yet is simply absent.
+    LOG_INFO(Frontend, "PS4 build: {}", __DATE__ " " __TIME__);
     LOG_INFO(Frontend, "PS4 options: {}", OptionsSummary());
     Common::PS4Diagnostics::Reset();
     if (Common::PS4Diagnostics::profiler) {
@@ -684,12 +695,15 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
             {
                 const u64 blocked_us = Common::PS4Diagnostics::guest_wait_us.exchange(0);
                 const u64 blocked_calls = Common::PS4Diagnostics::guest_wait_count.exchange(0);
+                // Logged every window even when it is zero: a run with a hundred heartbeats and no
+                // line here means the hook in svcWaitSynchronization never fired at all, which is a
+                // different finding from "the guest never blocks" and must not look the same.
+                LOG_INFO(Frontend,
+                         "PS4 guest waits: {} waits, {:.1f} ms/frame blocked in "
+                         "svcWaitSynchronization",
+                         blocked_calls, static_cast<double>(blocked_us) / 1000.0 * per_frame);
                 if (blocked_calls != 0) {
-                    LOG_INFO(Frontend,
-                             "PS4 guest waits: {} waits, {:.1f} ms/frame blocked in "
-                             "svcWaitSynchronization",
-                             blocked_calls,
-                             static_cast<double>(blocked_us) / 1000.0 * per_frame);
+
                     for (int i = 0; i < Common::PS4Diagnostics::kGuestWaitSlots; i++) {
                         auto& slot = Common::PS4Diagnostics::guest_waits[i];
                         if (!slot.name)
