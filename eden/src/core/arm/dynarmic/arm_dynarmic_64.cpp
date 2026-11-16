@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <new>
+
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -275,11 +277,18 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Code cache size
 #if defined(__OPENORBIS__)
-    // Do not raise this. The cache is allocated from *flexible* memory, so it competes with the
-    // C heap and Vulkan for whatever the guest DRAM left over. At 96 MiB the fourth core's
-    // allocation failed with 0x8002000c (ENOMEM) before emulation even started, and the
-    // resulting std::bad_alloc aborted the process. 64 MiB x4 is the size that fits.
-    config.code_cache_size = std::uint32_t(64_MiB);
+    // The cache is allocated from *flexible* memory, so it competes with the C heap and Vulkan for
+    // whatever the guest DRAM left over. Four 96 MiB caches (384 MiB) did not fit: the fourth
+    // allocation failed with 0x8002000c (ENOMEM) and the resulting std::bad_alloc aborted the
+    // process. 288 MiB total is known to allocate, so the first core (which translates by far the
+    // most guest code: 440k blocks and 4 self-clears in a 3 minute run, against 55-100k for the
+    // others) gets 96 MiB and the rest keep 64. Each self-clear throws every translated block away
+    // and re-compiles it, which is the largest stall this port has, so the extra room pays for
+    // itself twice over. ps4.ini "jit_cache_mb=N" overrides the size for experiments.
+    const std::uint32_t configured_mb = Common::PS4Diagnostics::jit_cache_mb.load();
+    config.code_cache_size =
+        configured_mb != 0 ? configured_mb * 1024u * 1024u
+                           : std::uint32_t(m_core_index == 0 ? 96_MiB : 64_MiB);
 #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
@@ -392,7 +401,29 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#ifdef __OPENORBIS__
+    // Flexible memory is shared with everything else in the process, so a request this large can
+    // fail at any time. Halve it until it fits instead of aborting the whole app: the cache that
+    // does fit still runs the guest, it just clears itself sooner.
+    for (;;) {
+        try {
+            m_jit.emplace(config);
+            break;
+        } catch (const std::bad_alloc&) {
+            const std::uint32_t next = config.code_cache_size / 2;
+            LOG_WARNING(Core, "PS4 JIT: {} MiB code cache failed to allocate, retrying with {} MiB",
+                        config.code_cache_size / (1024u * 1024u), next / (1024u * 1024u));
+            if (next < 32_MiB) {
+                throw;
+            }
+            config.code_cache_size = next;
+        }
+    }
+    LOG_INFO(Core, "PS4 JIT core {}: {} MiB code cache", m_core_index,
+             config.code_cache_size / (1024u * 1024u));
+#else
     m_jit.emplace(config);
+#endif
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {

@@ -577,3 +577,84 @@ against Run F are:
 
 For a pacing distribution: `sort -t, -k2 -n frames.log | tail` gives the worst frames
 and `awk -F, 'NR>1{s+=$2;n++}END{print s/n}' frames.log` the mean gap.
+
+## Run I — first gameplay run with numbers
+
+The launch screen fix worked and the game runs. This is the first run with `frames.log`
+turned on, so the pacing is measured instead of guessed. 3,573 frames over 160 s.
+
+| Metric | Value |
+|---|---|
+| Median frame | **33.3 ms = 30 fps** |
+| Mean frame | 44.9 ms (22.4 fps) |
+| p90 / p95 / p99 | 48.0 / 85.1 / 150.1 ms |
+| Worst frame | 4,202.8 ms |
+| Frames over 40 ms | 20.4% |
+| Time beyond the 30 fps budget | **42.0 s of 160.4 s (26%)** |
+| Guest presented | 3,483 flips (no missing presents) |
+
+The distribution is the important part: gaps come in exact multiples of 33.3 ms —
+33.3, 50.0, 66.7, 100.0, 150 ms. That is a 30 Hz vsync grid, so the emulator is not
+uniformly slow, it is **just missing the deadline**: a frame that needs 34 ms lands at
+50 ms (20 fps), one that needs 70 ms lands at 100 ms (10 fps). Windows of the run hit
+a clean 30.0 fps; others sit at 10.0 or 22.4 fps for minutes.
+
+### Where the time goes
+
+Per-core JIT counters from the same run (`PS4 JIT` lines):
+
+| Core | Blocks | Self-clears | Translate | Optimize | Emit (mprotect) |
+|---|---|---|---|---|---|
+| 0 | 440,000 | **4** | 5.5 s | 5.1 s | 35.4 s (7.0 s) |
+| 1 | 100,000 | 1 | 1.2 s | 1.3 s | 10.1 s (2.0 s) |
+| 2 | 55,000 | 1 | 0.7 s | 0.8 s | 5.8 s (1.1 s) |
+
+46 s of core 0's 202 s (23%) is spent compiling guest code, and the 64 MiB cache
+filled four times. A self-clear throws away every translated block and the guest
+re-compiles them on the next pass, which is exactly when the 4.2 s and 3.7 s frames
+happen. That is the single largest stall in the port.
+
+### Change: give the translating core a bigger cache
+
+The code cache is *flexible* memory shared with the C heap and Vulkan, so it cannot
+just be enlarged: 4 x 96 MiB (384 MiB) failed to allocate with `0x8002000c` in Run G
+and the `std::bad_alloc` aborted the app. 288 MiB total is known to allocate, so the
+first core now gets 96 MiB and the other three keep 64 MiB — the same total that was
+proven to work, aimed at the core with 4.4x the block count and 4x the clears.
+
+Two safety nets come with it:
+
+- Allocation failure no longer aborts. The request is halved and retried (96 -> 48 ->
+  32 MiB) instead of throwing `std::bad_alloc` out of the JIT constructor, so this
+  class of crash cannot happen again whatever the memory situation is.
+- `ps4.ini` `jit_cache_mb=N` overrides the size per core (0 = the built-in 96/64), so
+  a bigger value can be tried on the console without a rebuild; if it does not fit,
+  the log says so and the emulator keeps running with half the request.
+
+`eden.log` now states the size it settled on: `PS4 JIT core 0: 96 MiB code cache`.
+
+### What ACNHRecomp is, and what can be borrowed from it
+
+[ACNHRecomp](https://github.com/Nycolazs/ACNHRecomp) is a **static recompilation** of
+the game: the AArch64 code of `main`, `sdk` and `subsdk0` (about 19 million
+instructions) is translated ahead of time into C++, built with clang, its NVN graphics
+calls are translated to Vulkan and the system services are reimplemented natively. It
+is not an emulator and it is not a PS4 program: it is a desktop application (SDL3,
+Vulkan, a normal OS), written on the SuperMarioWonderRecomp framework. Running it on a
+PS4 would mean porting that port to Orbis — a full second harness — and it is the same
+project that was ruled out earlier in favour of the emulator fork.
+
+What is genuinely useful from it is its *findings*, all of which are cheap here:
+
+- it runs 30 fps on an Intel Iris Xe, i.e. the game's own workload is not the problem
+  and a 30 fps target is realistic;
+- it needed a **shader pre-compilation pass at startup** — the same conclusion this
+  port reached with the 430-pipeline disk cache, and the next step here is warming
+  those pipelines on a background thread so a new area does not compile mid-frame;
+- it added an option to **bypass the CPU-heavy audio reverb**, which is directly
+  applicable: audio is emulated on the same weak cores;
+- it accelerates **game data decryption with AES-NI**; the PS4's Jaguar supports AES
+  instructions, and this port decrypts game data in software, so the same trick would
+  cut load times (not frame time).
+
+None of those need ACNHRecomp's code — they are one-line-to-one-file changes here.

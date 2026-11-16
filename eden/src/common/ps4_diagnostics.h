@@ -21,6 +21,10 @@ inline std::atomic<bool> inline_memory{true};
 inline std::atomic<bool> direct_table{true};
 // Sampling profiler (ps4_sampler.cpp); off by default, ps4.ini "profile=on" enables it.
 inline std::atomic<bool> profiler{false};
+// ps4.ini "jit_cache_mb=N": JIT code cache per core in MiB; 0 keeps the built-in sizes (96 for the
+// first core, 64 for the rest). A cache that is too small clears itself, which throws every
+// translated block away and re-compiles it -- the biggest single stall this port has.
+inline std::atomic<u32> jit_cache_mb{0};
 // ps4.ini "framelog=1" (default): one line per presented frame in /data/ACNH/logs/frames.log.
 inline std::atomic<bool> framelog{true};
 // Guest memory accesses that left the JIT's inline page table walk (one 64-byte slot per core).

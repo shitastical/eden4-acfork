@@ -250,6 +250,10 @@ std::vector<Option> g_options = {
     {"regalloc", "JIT register tweaks",
      "Diagnostics: Off uses Dynarmic's original register allocation.", "debug",
      {{"on", "On"}, {"off", "Off"}}},
+    {"jit_cache_mb", "JIT code cache (MiB)",
+     "Per core; 0 uses 96 on the first core and 64 on the others. A cache that is too small clears "
+     "itself and re-compiles everything, which shows up as multi-second stalls.", "advanced",
+     {{"0", "Auto"}, {"64", "64"}, {"96", "96"}, {"128", "128"}, {"160", "160"}}},
 };
 #undef CONTROLLER_TYPES
 
@@ -305,6 +309,7 @@ void ApplyOptions() {
     Common::PS4Diagnostics::direct_table = enabled("direct_table");
     ps4_page_reuse = enabled("page_reuse");
     ps4_regalloc_free_moves = ps4_regalloc_r13 = enabled("regalloc");
+    Common::PS4Diagnostics::jit_cache_mb = static_cast<u32>(std::strtoul(OptionValue("jit_cache_mb"), nullptr, 10));
     auto& players = Settings::values.players.GetValue();
     for (size_t port = 0; port < OrbisFrontend::Controller::MaxPads; ++port) {
         const std::string_view type = OptionValue(fmt::format("player{}_type", port + 1));
