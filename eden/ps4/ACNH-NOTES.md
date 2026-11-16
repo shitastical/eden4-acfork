@@ -493,9 +493,11 @@ Operational notes that cost time before:
   its save.
 - The fork and a stock Eden4 install are independent: different title ids, different
   data roots. Uninstalling one leaves the other's data untouched.
-- Auto-launch can hide the menus completely; if a build seems to "hang" on a black
-  screen, check `logs/eden.log` for `Auto-launch: booting ...` before assuming a
-  crash, and set `autolaunch=0` to get the menu back.
+- Auto-launch can hide the menus completely. Until the game's first frame the screen
+  shows only the boot splash, and ACNH needs about a minute or more to get there, so
+  the splash is not a hang: `eden.log` carries a 10 s heartbeat with `stage=waiting
+  for guest display` while booting, and `frames.log` appears the moment the game
+  presents. Set `autolaunch=0` for the menu.
 
 ## Run H — the standalone build
 
@@ -514,10 +516,43 @@ Build facts for this pkg: `Animal Crossing New Horizons.pkg`, 68,681,728 B, `che
 all 28 package digests `OK`, uploaded to `/data/pkg/`. Console state: prepared and
 verified over FTP (tree, NSP, nand, shader cache, keys, `ps4.ini`).
 
-**Not yet measured:** this build has not been launched on the console yet — a pkg
-cannot be installed over FTP, so that step is manual (Install Package on the console).
-The first run is the decisive check for Run G, and the numbers to compare against
-Run F are:
+### First run — Run G is fixed, but the splash owns the screen while the game boots
+
+Installed and launched on the console. The 96 MiB crash is gone: four `PS4 JIT:
+65552 KiB` caches are allocated without complaint and boot continues past the
+launcher into the guest. Measured from the log of that run:
+
+| Time | Event |
+|---|---|
+| 0.19 s | `Auto-launch: booting /data/ACNH/games/Animal Crossing New Horizons [01006F8002326000][US][v0].nsp` |
+| 0.19 s | `PS4 launcher display: 1920x1080 ABGR garlic works` (the menu opened VideoOut; see below) |
+| 1.1-1.4 s | four JIT caches, 65,552 KiB each |
+| 2.28 s | `PS4 RADV display ready: 1280x720, 3 buffers`, `loading screen shown until the first game frame` |
+| 4.67 s | `LoadDiskResources: Total Pipeline Count: 430` — the moved shader cache is being used |
+| 7.5 s | `Vulkan driver pipelines cached at: /data/ACNH/cache/shader/01006f8002326000/vulkan_pipelines.bin` |
+| 47.5 s | still `composites=0, flips=0, stage=waiting for guest display`, 235k JIT blocks on the busy core |
+
+The app was closed at ~48 s, and the log proves the guest had not presented a single
+frame by then — which is why the boot splash was still on screen and looked like art
+sitting on top of the game. Two things were wrong, and both are fixed:
+
+1. **The launcher opened its own VideoOut for a screen nobody saw.** With
+auto-launch, the menu is skipped in the same instant, so the app opened VideoOut at
+1920x1080, flipped the splash, closed it, and the game then opened a second handle at
+1280x720. That handoff is how a splash ends up frozen over the graphics: the last
+frame of a closed client can stay on the output while the new client flips into
+buffers the screen is not showing. The launcher now creates its display lazily —
+when auto-launching there is exactly one VideoOut client for the whole run, the
+game's own, and the splash is its first frame. The menu still opens one when it is
+actually shown.
+2. **Nothing told the user the boot was alive.** ACNH needs on the order of a minute
+or more to reach its first frame on this port (Run F: renderer init at 47.6 s, and
+that was with the menu adding time). The boot splash is static, so a slow boot is
+indistinguishable from a frozen overlay. `logs/eden.log` has a 10-second heartbeat
+with `stage=` for exactly this; `frames.log` starts the moment the game does present.
+
+**Still to measure** (needs a run that lasts long enough): the numbers to compare
+against Run F are:
 
 | Metric | Run F (before) | Where to read it |
 |---|---|---|

@@ -1070,9 +1070,17 @@ void Launcher(OrbisFrontend::Controller& controller) {
     // (or wasn't found), quitting it has to land on the menu, not boot it again.
     bool autolaunch_pending = std::strcmp(OptionValue("autolaunch"), "1") == 0;
     while (true) {
-        auto display = std::make_unique<OrbisFrontend::Display>();
-        if (const auto mode = OrbisFrontend::WorkingDisplayMode())
-            Common::PS4Diagnostics::videoout_argb = mode->format == 0x80000000;
+        // Opened only when this run actually shows the menu. Auto-launching means the game's own
+        // display is the first (and only) VideoOut client, so nothing of ours can be left flipped
+        // on top of the game: a handle opened here, flipped at 1080p and closed again before the
+        // game opens its 720p one is exactly how a splash screen stays frozen over the graphics.
+        std::unique_ptr<OrbisFrontend::Display> display;
+        const auto ensure_display = [&] {
+            if (display) return;
+            display = std::make_unique<OrbisFrontend::Display>();
+            if (const auto mode = OrbisFrontend::WorkingDisplayMode())
+                Common::PS4Diagnostics::videoout_argb = mode->format == 0x80000000;
+        };
         // PS4 Pro mode refused 1280x720 VideoOut buffers (00.21); base mode takes them.
         Common::PS4Diagnostics::videoout_needs_1080 = sceKernelIsNeoMode() != 0;
         auto canvas = std::make_unique<Ui::Canvas>();
@@ -1115,11 +1123,14 @@ void Launcher(OrbisFrontend::Controller& controller) {
             if (frames == 0) LOG_INFO(Frontend, "PS4 HOME menu: first render");
             ui.Render(*canvas);
             if (frames == 0) LOG_INFO(Frontend, "PS4 HOME menu: first present");
+            ensure_display();
             display->Present(canvas->Pixels());
             if (++frames == 1) LOG_INFO(Frontend, "PS4 HOME menu: first frame shown");
         }
         ui.RenderLoading(*canvas, launch);
-        display->Present(canvas->Pixels());
+        // With auto-launch there is no menu display to update, and the game's swapchain puts this
+        // very canvas up as its first frame; drawing it here is enough.
+        if (display) display->Present(canvas->Pixels());
         // The game's display keeps showing this while the game boots.
         delete Common::PS4Diagnostics::loading_picture.exchange(
             new std::vector<u32>(canvas->Pixels(), canvas->Pixels() + size_t(Ui::Canvas::Width) * Ui::Canvas::Height));
