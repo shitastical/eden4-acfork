@@ -1098,9 +1098,16 @@ write invalidates a range — the change is only *when* it runs and that the cod
   so a pathological guest cannot grow the table without bound. The table costs ~70 bytes
   per kept block (~28 MB at the cap), which is the price of the feature.
 
-Both fallbacks keep today's behaviour, and `ps4.ini`'s `block_reuse=0` turns the whole
-thing off (`JIT block reuse`, System Settings → debug), in which case the build is
-byte-for-byte the old flush behaviour.
+Both fallbacks keep today's behaviour, and `block_reuse=0` in `/data/ACNH/ps4.ini` turns the
+whole thing off (`JIT block reuse`, System Settings → debug) — that build records no proofs
+and discards the cache at every flush, exactly as before. If a run of this build misbehaves
+in any way, that is the first thing to try, and it costs nothing else.
+
+Keeping `patch_information` across a flush also means those site lists are no longer freed
+by a flush, so peak memory for the emitter grows by roughly the number of kept blocks
+(one small map entry per location that is jumped to). It is bounded by the block count,
+which the code cache already bounds, but it is a real increase and the reason the proof
+table needed a cap.
 
 ### What the log says
 
