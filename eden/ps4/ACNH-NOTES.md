@@ -332,6 +332,48 @@ Both are CPU-side, since the GPU has been ruled out:
    fourteen minutes; each clear discards translated code that must be rebuilt. Memory
    is available now (heap plateaued at 368 MiB, ~450 MiB largest free block).
 
+## What the community advice is worth on this port
+
+Researched because it is the obvious place to look, and worth recording so nobody tries
+it twice. Almost all of it is written for *stock yuzu on a desktop*, and this tree is a
+trimmed fork on fixed hardware.
+
+| Advice | Verdict for this port |
+|---|---|
+| "Set GPU accuracy to Normal" | Dead. `gpu_accuracy` is read only by Qt UI code (see Run F). |
+| "Force maximum clocks" | Dead. Requests a driver clock boost; the GPU is idle. |
+| "Use fast GPU time (hack)" | Cannot be applied: the setting does not exist in this tree. It would not help a CPU-bound frame anyway. |
+| "Use asynchronous shader building" | Does not exist in this tree. Would remove first-encounter hitches, not raise steady fps. |
+| "Turn off SMT" (Steam Deck) | Not applicable as written — PS4 has no SMT — but it is a *scheduling* effect, which is the most interesting remaining clue (cores sit at 44–69% busy while the frame takes 47 ms, which is latency, not throughput). |
+| "Extended memory layout (6 GB)" | Wrong direction: the console only has 4608 MiB and guest DRAM is already sized down to survive. |
+| "Disable DOF / shadows mod" | ACNH does have such mods, but LayeredFS on yuzu-family emulators is a documented trap: ACNH mods can make the game take "10 minutes to 10 hours" to load. Not worth it against a 47 ms frame that is already CPU-bound (DOF is GPU work). |
+
+ACNH's own settings surface is also thin by design: it is a fixed-30 fps, dynamic
+resolution title with no in-game performance options.
+
+### Where the remaining 14 ms actually has to come from
+
+Frame budget at 30 fps is 33.3 ms; we measure 47.2 ms. Per-thread occupancy from the
+profiled run is core0 69%, core1 55%, core2 44% — about 1.7 cores of total work. If the
+frame were throughput-bound on one thread, that thread would be pinned at 100%. It is
+not. So a meaningful part of the 47 ms is *latency between guest threads*, not raw
+instruction throughput, which is why the JIT-side knobs keep returning single-digit
+percentages.
+
+The three remaining candidates, in order of expected value:
+
+1. **Cross-thread wake latency.** ACNH's task system ping-pongs work between its
+   threads. Anything that adds latency per hand-off (host futex wake, scheduler
+   re-entry) multiplies by the number of sync points per frame. This is the same effect
+   the Steam Deck crowd got by disabling SMT, i.e. a scheduling change, not a codegen
+   change.
+2. **JIT throughput.** Already at the edge of what this fork exposes: `Auto` is
+   `Unsafe_Optimize`-equivalent, fastmem is 64-bit, memory goes through the direct
+   table (one dependent load per page, no attribute decoding), block linking is on, and
+   cycle counting is off because multicore passes `uses_wall_clock`.
+3. **Guest work itself.** Only reducible with game-side mods, which the loader makes
+   expensive for this title.
+
 ## Iterating on the console
 
 There is no hot-swap path for code. `/user/app/EDEN00002/` holds only `app.pkg`
