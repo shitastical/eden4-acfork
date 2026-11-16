@@ -89,12 +89,12 @@ size_t KSystemControl::Init::GetIntendedMemorySize() {
 #ifdef __OPENORBIS__
         // The PS4 owns 4608 MiB of direct memory and the GPU and the C heap share whatever guest
         // RAM does not take. At 4 GiB only ~89 MiB stayed free and Animal Crossing died on
-        // std::bad_alloc in-game, so give the host 256 MiB back by trimming the applet pool below
+        // std::bad_alloc in-game, so give the host 448 MiB back by trimming the applet pool below
         // by the same amount. That pool exists for HOME-menu applets and the software keyboard and
         // sits idle here; the application pool keeps its full 3285 MiB, so the guest's memory is
         // unchanged, and the 304 MiB of kernel DRAM beneath the pools does not move, which keeps
         // the pool partition layout valid.
-        return 3840_MiB;
+        return 3648_MiB;
 #else
         return 4_GiB;
 #endif
@@ -159,9 +159,9 @@ size_t KSystemControl::Init::GetAppletPoolSize() {
         case Smc::MemoryArrangement_4GB:
         default:
 #ifdef __OPENORBIS__
-            // Pairs with the 3840 MiB in GetIntendedMemorySize: 3285 + 251 leaves the same 304 MiB
+            // Pairs with the 3648 MiB in GetIntendedMemorySize: 3285 + 59 leaves the same 304 MiB
             // of kernel DRAM below the pools as the stock 3285 + 507 does at 4 GiB.
-            return 251_MiB;
+            return 59_MiB;
 #else
             return 507_MiB;
 #endif

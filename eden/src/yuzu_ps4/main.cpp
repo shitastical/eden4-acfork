@@ -509,10 +509,11 @@ void RunGame(const Game& game, OrbisFrontend::Controller& controller) {
         ps4_sampler_enable_block_map();
         ps4_sampler_start();
     }
-    // 4 GiB of guest RAM leaves ~512 MiB of direct memory. Reserving half of it for the GPU capped
-    // the C heap at 248 MiB, where tending the pipeline cache ran it into std::bad_alloc while
-    // direct memory was still free; 128 MiB keeps the GPU a share and lets the heap grow past that.
-    ps4_heap_set_overflow_gpu_reserve(128ull << 20);
+    // Whatever guest RAM does not take is shared by the GPU and the C heap. Holding half of it back
+    // capped the heap at 248 MiB and it died on std::bad_alloc while direct memory sat free; at
+    // 128 MiB it still ran out on the island intro with 168 MiB free but no single block big enough
+    // to satisfy it. Keep only enough for the GPU's small allocations -- it reclaims on failure.
+    ps4_heap_set_overflow_gpu_reserve(32ull << 20);
     Common::PS4Diagnostics::LogDirectMemory("before guest RAM");
     const auto previous_renderer = Settings::values.renderer_backend.GetValue();
     Settings::values.renderer_backend.SetValue(game.renderer.value_or(previous_renderer));

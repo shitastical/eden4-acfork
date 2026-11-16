@@ -13,7 +13,7 @@ character creation. Long-session stability is still being measured — see
 | Fact | Value |
 |---|---|
 | Direct memory | 4608 MiB |
-| Guest DRAM requested | 4096 MiB originally, **3840 MiB now** (see below) |
+| Guest DRAM requested | 4096 MiB originally, then 3840, **3648 MiB now** (see below) |
 | Guest RAM placement | `0x20002c000`, software page tables |
 | FTP | `ftp://<console>:2121`, anonymous, GoldHEN |
 | Installed app | `/user/app/EDEN00002/` — `app.pkg` (65,536,000 B), `app.pbm`, `app.json`, `app.xml` |
@@ -100,7 +100,23 @@ gets smaller.
 
 **Run C — reserve 128 MiB, guest 3840 MiB, applet pool 251 MiB**
 
-Expected: ~345 MiB of free direct memory instead of 89 MiB. Awaiting a long test.
+| Measurement | Value |
+|---|---|
+| Survived | **816 s** (13.6 min), died during the island intro on the plane |
+| Overflow heap | climbed 152 → 248 → 280 → 368 → 400 → **464 MiB** |
+| Largest free block | 151–168 MiB |
+| Frame rate | 9.2–18.0 fps |
+| JIT (busy core) | 605,000 blocks, emit 52.2 s, mprotect 9.7 s, **6 cache clears** |
+
+No longer a hard ceiling: the heap reached 464 MiB against a ~640 MiB limit. It died
+because no *single contiguous* block was big enough any more — 168 MiB free, and the
+island intro wanted more than that at once. The reserve was still holding memory the
+heap could otherwise have had.
+
+**Run D — reserve 32 MiB, guest 3648 MiB, applet pool 59 MiB**
+
+Expected: ~450 MiB of contiguous free direct memory. Awaiting a long test. Only the
+applet pool gives anything up; the application pool is still 3285 MiB.
 
 ## Shrinking guest RAM, and the trap in it
 
@@ -150,13 +166,29 @@ the first thing to suspect.
 
 ## Performance
 
-Not yet optimised; this is the baseline to work from.
+Not yet optimised; this is the baseline to work from. Target is 30 fps.
 
-- In-game: 17–29 fps, frame time 33–53 ms, emulation speed reported as 100%.
-- The loading screen is dominated by JIT work: ~460k blocks translated, **37.9 s in
-  emit and 7.2 s in `mprotect` alone**, with **4 cache clears** on the busy core.
-- 4 cache clears means the 64 MiB code cache is *too small* for ACNH's code. Cutting
+- In-game: **9–18 fps**, frame time 33–99 ms. The guest asks for 30.
+- The JIT is *not* an obvious misconfiguration: `cpu_accuracy` defaults to `Auto`,
+  which turns on `unsafe_optimizations`, block linking, fast dispatch and
+  `Unsafe_IgnoreGlobalMonitor`. Check that before blaming codegen.
+- The loading screen is dominated by JIT work: ~605k blocks translated, **52.2 s in
+  emit, 9.7 s of it in `mprotect`**, with **6 cache clears** on the busy core.
+- 6 cache clears means the 64 MiB code cache is too small for ACNH's code. Cutting
   it to buy memory would trade a crash for a worse frame rate — don't.
+- `memory callbacks` sounds alarming (166 million) but over a 13-minute run that is
+  ~0.02% of executed instructions. It is a red herring; don't chase it.
+- **How to tell whether the frame is CPU- or GPU-bound:** count the `stage=` values
+  in the heartbeat. `waiting for next guest display` means the frontend finished
+  copying and is idle waiting for the guest to produce a frame; `copying to VideoOut
+  buffer` means the reverse. Run C was 71/80 samples *waiting*, with `emulation
+  speed 100%` — i.e. the guest clock is on time and the guest itself is slow, but
+  that is also what a fence-blocked guest looks like, so attribute it with the
+  profiler (`ps4.ini` `profile=on`) before optimising: it logs `PROFILE` lines with
+  the hottest guest PCs plus the code at them.
+- `use_disk_shader_cache` was `false` upstream, so every launch recompiled every
+  pipeline. It is now `true` and `LoadDiskResources` runs after the renderer starts,
+  which removes the repeat cost on later launches.
 - `use_disk_shader_cache` was `false` upstream, so every launch recompiled every
   pipeline. It is now `true` and `LoadDiskResources` runs after the renderer starts,
   which removes the repeat cost on later launches.
