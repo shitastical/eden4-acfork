@@ -39,6 +39,12 @@
 #include "dynarmic/backend/x64/perf_map.h"
 #include "dynarmic/backend/x64/stack_layout.h"
 
+#ifdef __OPENORBIS__
+// Defined in the PS4 runtime's sampler: drops the host address to guest block map the profiler
+// uses, which a cache clear invalidates along with the translated blocks themselves.
+extern "C" void ps4_sampler_reset_blocks();
+#endif
+
 namespace Dynarmic::Backend::X64 {
 
 const Xbyak::Reg64 BlockOfCode::ABI_JIT_PTR = HostLocToReg64(Dynarmic::Backend::X64::ABI_JIT_PTR);
@@ -407,6 +413,9 @@ void BlockOfCode::ClearCache() {
     ASSERT(prelude_complete);
 #ifdef __OPENORBIS__
     ps4_clears++;
+    // The guest asked for an instruction cache flush. Every translation is discarded, so the
+    // sampler's host to guest block map has to go with them.
+    ps4_sampler_reset_blocks();
 #endif
     SetCodePtr(code_begin);
 }

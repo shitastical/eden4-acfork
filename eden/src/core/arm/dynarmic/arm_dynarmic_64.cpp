@@ -281,10 +281,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // whatever the guest DRAM left over. Four 96 MiB caches (384 MiB) did not fit: the fourth
     // allocation failed with 0x8002000c (ENOMEM) and the resulting std::bad_alloc aborted the
     // process. 288 MiB total is known to allocate, so the first core (which translates by far the
-    // most guest code: 440k blocks and 4 self-clears in a 3 minute run, against 55-100k for the
-    // others) gets 96 MiB and the rest keep 64. Each self-clear throws every translated block away
-    // and re-compiles it, which is the largest stall this port has, so the extra room pays for
-    // itself twice over. ps4.ini "jit_cache_mb=N" overrides the size for experiments.
+    // most guest code: 430k blocks in a 3 minute run, against 55-100k for the others) gets 96 MiB
+    // and the rest keep 64. The clears counted in the stats are the guest's own `IC IALLU`, not
+    // capacity, so a bigger cache only delays a capacity clear rather than removing those; see
+    // ACNH-NOTES.md Run K. ps4.ini "jit_cache_mb=N" overrides the size for experiments.
     const std::uint32_t configured_mb = Common::PS4Diagnostics::jit_cache_mb.load();
     config.code_cache_size =
         configured_mb != 0 ? configured_mb * 1024u * 1024u

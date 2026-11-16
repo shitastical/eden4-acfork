@@ -734,3 +734,105 @@ and the guest's own AArch64 code at those PCs, which is the same method ACNHReco
 to find its reverb. It costs a little (order 1%) and makes that run's fps slightly
 pessimistic; it is on because knowing where the remaining 8% goes is worth more than a
 clean number.
+
+## Run K — RWX confirmed, the profile arrives, and the clears are not capacity
+
+Run J's build with the RWX code cache and `profile=on`. 4,081 frames over 247 s:
+median 33.12 ms, mean 43.52 (23.0 fps), p90 49, **32.0% of frames over 34 ms**. By ten
+second window: 28.9–29.3 fps from 87 s to 147 s, then 25.3, 17.4, 17.2, 14.1, 13.8,
+16.0, 16.7, 21.5, 21.8 — the same shape as Run J, and the same two problems.
+
+### The mprotect change worked and bought nothing
+
+```
+alloc: PS4 JIT: 98320 KiB in regular flexible memory at 0x2e4024000 (RWX)
+PS4LogStats: 430000 blocks, translate 5003 ms, optimize 4860 ms, emit 30003 ms
+             (mprotect 0 ms, 0 calls), 3 cache clears, 201268 ms since cache start
+```
+
+0 calls, so the emit path is now permission-change free, and emit fell from 34.2 s
+(Run J, 145 s) to 30.0 s over a longer run. The frame rate did not move, because core 0
+was never saturated by that path — see below. Removing 12 s of overhead from a core
+that is 85% busy at 29 fps should have shown up as a small fps gain; that it did not is
+the useful part of this run.
+
+### The profile says the display never throttles and no core is pegged
+
+Host-side, summed over 24 ten-second windows per thread (`eboot` = our own `.text`,
+`system` = PS4 libraries, `guest-jit` = translated code, `other` = everything else):
+
+| Thread | our C++ | system libs |
+|---|---|---|
+| CPUCore_0 | 21.3% | 24.3% |
+| CPUCore_1 | 12.4% | 47.0% |
+| CPUCore_2 | 9.2% | 58.0% |
+| CPUCore_3 | 0.1% | 99.9% |
+| VulkanWorker | 3.4% | 96.6% |
+| GPU | 6.6% | 93.3% |
+| HostTiming | 27.2% | 72.8% |
+
+One libkernel address, `0x800003710`, is 88–100% of the system samples on those
+threads: it is a blocking wait, and the renderer, the GPU thread, the audio thread and
+the third guest core are all parked in it. `composites` equals `flips` in **every**
+window of the run, and `display wait 0.0 ms/frame`, `gpu idle 0.0 ms/frame` stay zero,
+so the swapchain never makes the game wait for a slot or for the GPU. **The guest sets
+the frame rate; nothing on our side paces it.**
+
+Core 0 is the critical path at ~85% busy in the 29 fps windows, and its guest-code
+share is the 54.4% that landed in `other`.
+
+### Two mistakes in that profile
+
+- `guest-jit` is **0.0% everywhere** and every translated sample fell into `other`. The
+  classifier tested `address >= 0x300000000 && address < 0x400000000`, but the caches
+  are allocated at `0x2e4024000`–`0x2f2030000`. So `guestPcOf()` was never consulted
+  and `PROFILE code`/`PROFILE page` came out empty: the run could not name a single
+  guest function.
+- The block map only holds 262,144 registrations and a run compiles 430,000, so after
+  the map filled, later blocks were not recorded at all.
+
+Fixed by deriving the span from the registered blocks (`g_jit_low`/`g_jit_high` in
+`sortBlocks`) instead of a fixed window, preferring the newest registration for a host
+address, and calling `ps4_sampler_reset_blocks()` from `BlockOfCode::ClearCache` so a
+flush throws the map away with the code it described. Reporting only — no effect on
+emulation.
+
+### Where our own C++ goes (symbolized against `build/eden/bin/eden-ps4`)
+
+Top addresses of our `.text` on core 0: `memset`, `Xbyak::CodeArray::db(int)` (the
+emitter, three buckets ≈ 16 points of the printed list), `Dynarmic::IR::Value::IsImmediate`,
+`Dynarmic::SpinLock::Unlock`. On `HostTiming`: `Service::HID::NPad::OnUpdate`,
+`Core::Timing::CoreTiming::Advance` ×2, `std::__shared_weak_count::lock`,
+`__wrap_clock_gettime`. On the GPU thread: `Tegra::DmaPusher::CallMethod`,
+`Tegra::DmaPusher::ProcessCommands`, `memcpy`.
+
+Translation is **19.8% of core 0's wall time** (emit 30.0 s + translate 5.0 s +
+optimize 4.9 s in 201 s), and it is the largest single thing we control.
+
+### Correction: the clears are the guest asking for them
+
+`ClearCache()` is reached only from `DynarmicCallbacks64::InstructionCacheOperationRaised`
+for `IC IALLU`/`IALLUIS` — the guest invalidating its whole instruction cache. ACNH does
+it three times in four minutes. **No cache size removes them**: `jit_cache_mb` only
+delays a capacity clear, and there were none. The 3 clears are the guest's, and each one
+throws away every translation, so ~2/3 of that 30 s of emit is re-compiling code that had
+already been compiled. Only a guest range-limited invalidation (which `IC IALLU` cannot
+give us) or write-tracking every executable page could avoid it, and both are a bigger
+change than the win available elsewhere.
+
+### Could recompiled guest code be grafted in? No.
+
+A static recompilation is not a library of fast functions. Each generated function is
+compiled against its own runtime: a fixed guest memory base, its own TLS and thread
+state, its own HLE shims for `libSce*`/AVN, and an NVN→Vulkan layer that owns the
+process. To call one from dynarmic you would need the guest registers in an x86-64 ABI
+shim, identical guest memory addressing, a re-entry trampoline back into the JIT, and a
+way to make dynarmic give up invalidation for that range — while the guest still issues
+`IC IALLU` and still patches its own code. ACNHRecomp's output is also generated for one
+specific memory layout of one specific NSP build. Per function, that is days of bespoke,
+unverifiable work, and it breaks the one requirement of this fork: don't break this game.
+
+What is worth taking from it is its *method* — sample, name the hot guest function,
+then attack that one thing — and the numbers above say where to attack first: 19.8% of
+the critical core is spent compiling guest code, and we cannot even name the guest
+functions yet. The next run will, with the range fixed.

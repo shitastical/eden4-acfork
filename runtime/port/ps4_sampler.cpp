@@ -106,6 +106,12 @@ std::atomic<JitBlock*> g_blocks{nullptr};
 std::atomic<uint32_t> g_block_count{0};
 uint32_t g_block_order[kMaxBlocks];  // indices sorted by host address (sampler thread only)
 uint32_t g_sorted_blocks = 0;
+// Host span covered by the translated blocks. The code caches are flexible-memory mappings at
+// whatever address the allocator hands out (0x2e4... on the console, not any fixed window), so the
+// span comes from the blocks themselves; samples inside it but outside a block are the dispatcher
+// and prelude ("glue").
+uint64_t g_jit_low = ~0ULL;
+uint64_t g_jit_high = 0;
 
 // Report text of the last windows, drained by the application into its own log.
 constexpr size_t kReportCap = 192 * 1024;
@@ -139,6 +145,8 @@ void sortBlocks() {
     JitBlock* blocks = g_blocks.load(std::memory_order_acquire);
     if (!blocks) {
         g_sorted_blocks = 0;
+        g_jit_low = ~0ULL;
+        g_jit_high = 0;
         return;
     }
     const uint32_t count = std::min(g_block_count.load(std::memory_order_acquire), kMaxBlocks);
@@ -147,9 +155,23 @@ void sortBlocks() {
         if (blocks[i].host != 0)
             g_block_order[n++] = i;
     }
-    std::sort(g_block_order, g_block_order + n,
-              [blocks](uint32_t a, uint32_t b) { return blocks[a].host < blocks[b].host; });
+    // A cache clear re-compiles the same guest code into the same host addresses, so for equal
+    // hosts the newest registration is the live one: sort by host, then by registration order.
+    std::sort(g_block_order, g_block_order + n, [blocks](uint32_t a, uint32_t b) {
+        return blocks[a].host != blocks[b].host ? blocks[a].host < blocks[b].host : a < b;
+    });
     g_sorted_blocks = n;
+    g_jit_low = ~0ULL;
+    g_jit_high = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const JitBlock& block = blocks[g_block_order[i]];
+        const uint64_t size = block.info >> 48;
+        g_jit_low = std::min(g_jit_low, block.host);
+        g_jit_high = std::max(g_jit_high, block.host + (size ? size : 1));
+    }
+    if (n != 0 && g_jit_low >= 0x10000) {
+        g_jit_low -= 0x10000;  // dispatcher, prelude and constant pool sit below the first block
+    }
 }
 
 // Guest PC of the block containing a JIT address, or ~0 if none.
@@ -219,7 +241,8 @@ void report(ThreadSamples& t, double window_start) {
             sys_keys[sys++] = address & ~0xFULL;
         } else if (address >= text && address < text + kTextWindow) {
             eboot_keys[eboot++] = (address - text) & ~0xFULL;
-        } else if (address >= 0x300000000ULL && address < 0x400000000ULL) {  // JIT caches (flexible memory)
+        } else if ((address >= g_jit_low && address < g_jit_high) ||
+                   (address >= 0x300000000ULL && address < 0x400000000ULL)) {  // JIT caches (flexible memory)
             const uint64_t pc = guestPcOf(address);
             if (pc == ~0ULL) {
                 glue++;
@@ -689,6 +712,13 @@ extern "C" void ps4_sampler_enable_block_map() {
         return;
     g_block_count.store(0);
     g_blocks.store(static_cast<JitBlock*>(calloc(kMaxBlocks, sizeof(JitBlock))), std::memory_order_release);
+}
+
+// Drops the block map. A cache clear re-compiles guest code into the same host addresses, so the
+// old entries would otherwise answer for code that no longer lives there (and the map only holds
+// 262144 registrations, fewer than one long run compiles).
+extern "C" void ps4_sampler_reset_blocks() {
+    g_block_count.store(0, std::memory_order_release);
 }
 
 extern "C" void ps4_jit_block_register(uintptr_t host, uint32_t size, uint64_t guest_pc) {
